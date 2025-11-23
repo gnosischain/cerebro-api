@@ -1,0 +1,35 @@
+#Python Bytecode
+pycache/
+*.py[cod]
+*$py.class
+
+#Virtual Environments
+venv/
+.venv/
+env/
+
+#Environment Variables (CRITICAL: Contains API Keys)
+.env
+
+#Local dbt Manifest (Downloaded locally for dev, but fetched via URL in prod)
+
+manifest.json
+
+#IDE & OS Files
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+#Logs
+*.log
+
+#Docker (if you have local overrides)
+docker-compose.override.yml
+
+#Testing
+.pytest_cache/
+.coverage
+htmlcov/

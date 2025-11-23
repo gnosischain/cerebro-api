@@ -1,0 +1,46 @@
+# ==============================================================================
+# API DEFINITION FILE
+# Define which dbt models to expose and how they can be filtered.
+# ==============================================================================
+
+defaults:
+  default_limit: 100
+  max_limit: 1000
+
+endpoints:
+  # --- Consensus Layer ---
+  - path: "/consensus/validators/active"
+    model: "api_consensus_validators_active_daily"
+    summary: "Active Validators Daily"
+    description: "Historical count of active validators on the Gnosis Chain."
+    tags: ["Consensus", "Validators"]
+    order_by: "date DESC"
+    parameters:
+      - name: "start_date"
+        column: "date"
+        operator: ">="
+        type: "date"
+      - name: "end_date"
+        column: "date"
+        operator: "<="
+        type: "date"
+
+  - path: "/consensus/staked"
+    model: "api_consensus_staked_daily"
+    summary: "Total Staked ETH"
+    tags: ["Consensus", "Financial"]
+    order_by: "date DESC"
+
+  # --- Execution Layer ---
+  - path: "/execution/gas/monthly"
+    model: "fct_execution_blocks_gas_usage_monthly"
+    summary: "Monthly Gas Usage"
+    tags: ["Execution", "Gas"]
+    order_by: "month DESC"
+
+  # --- ESG Data ---
+  - path: "/esg/energy"
+    model: "api_esg_energy_monthly"
+    summary: "Monthly Energy Consumption"
+    tags: ["ESG"]
+    order_by: "date DESC"
