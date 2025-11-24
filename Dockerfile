@@ -1,29 +1,49 @@
+# Build stage
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Production stage
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /code
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 appuser
 
-# Install python dependencies
-COPY ./requirements.txt /code/requirements.txt
-RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
+# Copy installed packages from builder
+COPY --from=builder /root/.local /home/appuser/.local
 
-# Copy application code and configuration
+# Ensure scripts are in PATH
+ENV PATH=/home/appuser/.local/bin:$PATH
+
+# Copy application code
 COPY ./app /code/app
-COPY ./api_config.yaml /code/api_config.yaml
 
-# In a real CI/CD, manifest.json comes from the build artifact. 
-# For local dev, we copy it in.
-COPY ./manifest.json /code/manifest.json
+# Set ownership
+RUN chown -R appuser:appuser /code
 
-# Set non-root user for security
-RUN useradd -m myuser
-USER myuser
+# Switch to non-root user
+USER appuser
 
 # Expose port
 EXPOSE 8000
 
-# Command to run the application
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/ || exit 1
+
+# Run the application
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
