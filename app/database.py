@@ -12,7 +12,7 @@ class ClickHouseClient:
         """
         if cls._client is None:
             cls._client = clickhouse_connect.get_client(
-                host=settings.CLICKHOUSE_HOST,
+                host=settings.CLICKHOUSE_URL,
                 port=settings.CLICKHOUSE_PORT,
                 username=settings.CLICKHOUSE_USER,
                 password=settings.CLICKHOUSE_PASSWORD,
