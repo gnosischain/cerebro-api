@@ -21,22 +21,128 @@ class DynamicRouter:
                 return yaml.safe_load(f)
         return {}
 
+    def _extract_api_resource(self, dbt_tags: List[str]) -> Optional[str]:
+        """
+        Extract resource name from 'api:xyz' tag.
+        
+        Examples:
+            ["production", "consensus", "api:blob_commitments"] -> "blob_commitments"
+            ["production", "execution", "api:gas_used"] -> "gas_used"
+            ["production", "consensus"] -> None
+        """
+        for tag in dbt_tags:
+            if tag.startswith("api:"):
+                resource = tag[4:].strip()
+                if resource:
+                    return resource
+        return None
+
+    def _extract_granularity(self, dbt_tags: List[str]) -> Optional[str]:
+        """
+        Extract granularity from 'granularity:xyz' tag.
+        
+        Examples:
+            ["production", "granularity:daily"] -> "daily"
+            ["production", "granularity:latest"] -> "latest"
+            ["production", "consensus"] -> None
+        """
+        for tag in dbt_tags:
+            if tag.startswith("granularity:"):
+                granularity = tag[12:].strip().lower()
+                if granularity:
+                    return granularity
+        return None
+
+    def _extract_category(self, dbt_tags: List[str]) -> str:
+        """
+        Extract primary category (first non-system, non-prefixed tag).
+        
+        Examples:
+            ["production", "consensus", "tier1", "api:blob"] -> "consensus"
+            ["production", "execution", "api:gas"] -> "execution"
+            ["production", "api:test"] -> "general"
+        """
+        system_tags = {
+            'production', 'view', 'table', 'incremental',
+            'staging', 'intermediate',
+            # Granularity values (in case used as standalone tags)
+            'daily', 'weekly', 'monthly', 'hourly',
+            'latest', 'in_ranges', 'last_30d', 'last_7d', 'all_time'
+        }
+        
+        for tag in dbt_tags:
+            tag_lower = tag.lower()
+            # Skip system tags
+            if tag_lower in system_tags:
+                continue
+            # Skip tier tags
+            if re.match(r'^tier\d+$', tag_lower):
+                continue
+            # Skip prefixed tags (api:, granularity:)
+            if ':' in tag:
+                continue
+            return tag_lower
+        
+        return "general"
+
+    def _build_url_path(self, model_name: str, dbt_tags: List[str], override: dict) -> str:
+        """
+        Build URL path from tags.
+        
+        Path structure: /{category}/{resource}/{granularity?}
+        
+        Examples:
+            tags=["production", "consensus", "api:blob_commitments", "granularity:daily"]
+            -> /consensus/blob_commitments/daily
+            
+            tags=["production", "execution", "api:transactions"]
+            -> /execution/transactions
+        """
+        # Manual override takes precedence
+        if override.get("path"):
+            return override["path"]
+        
+        # Extract components from tags
+        api_resource = self._extract_api_resource(dbt_tags)
+        
+        if not api_resource:
+            # This shouldn't happen if _build_routes filters correctly,
+            # but provide a fallback just in case
+            return None
+        
+        category = self._extract_category(dbt_tags)
+        granularity = self._extract_granularity(dbt_tags)
+        
+        # Build: /{category}/{resource}/{granularity?}
+        path_parts = [category, api_resource]
+        if granularity:
+            path_parts.append(granularity)
+        
+        return "/" + "/".join(path_parts)
+
     def _build_routes(self):
         """
-        Build routes for models that:
-        1. Start with 'api_' prefix
-        2. Have the 'production' tag
+        Build routes for models that have BOTH:
+        1. The 'production' tag
+        2. An 'api:' tag defining the resource name
         
-        Uses remaining tags for grouping in Swagger UI.
+        Models without an 'api:' tag are NOT exposed, even if they start with 'api_'.
         """
         models_to_expose = set()
 
-        # Auto-discovery: Only expose models with 'api_' prefix AND 'production' tag
+        # Auto-discovery: Only expose models with 'production' AND 'api:' tags
         for model_name in manifest.get_all_models():
-            if model_name.startswith("api_"):
-                dbt_tags = manifest.get_tags(model_name)
-                if "production" in dbt_tags:
-                    models_to_expose.add(model_name)
+            dbt_tags = manifest.get_tags(model_name)
+            
+            # Must have 'production' tag
+            if "production" not in dbt_tags:
+                continue
+            
+            # Must have an 'api:' tag
+            if self._extract_api_resource(dbt_tags) is not None:
+                models_to_expose.add(model_name)
+
+        print(f"📡 Discovered {len(models_to_expose)} models with 'production' + 'api:' tags")
 
         # Manual overrides from config
         manual_endpoints = self.manual_config.get("endpoints", [])
@@ -47,7 +153,7 @@ class DynamicRouter:
             manual_settings = manual_map.get(model_name, {})
             self._create_auto_route(model_name, manual_settings)
 
-        # Also add any manual endpoints explicitly defined (even without production tag or api_ prefix)
+        # Also add any manual endpoints explicitly defined (even without api: tag)
         for ep in manual_endpoints:
             if ep["model"] not in models_to_expose:
                 self._create_auto_route(ep["model"], ep)
@@ -56,37 +162,46 @@ class DynamicRouter:
         """
         Convert dbt tags into Swagger UI sections.
         
-        Filters out 'production', tier tags, and other system tags, then uses the FIRST
-        remaining tag as the main category. This groups all related endpoints
-        together (e.g., all Execution endpoints under one "Execution" section).
+        Filters out 'production', tier tags, prefixed tags (api:, granularity:),
+        and other system tags, then uses the FIRST remaining tag as the main category.
         
         Examples:
-            ["production", "execution", "transactions"] -> ["Execution"]
-            ["production", "consensus", "validators", "active"] -> ["Consensus"]
-            ["production", "financial"] -> ["Financial"]
-            ["production"] -> ["General"]
+            ["production", "consensus", "api:blob", "granularity:daily"] -> ["Consensus"]
+            ["production", "execution", "tier1", "api:gas"] -> ["Execution"]
+            ["production", "api:test"] -> ["General"]
         """
-        # Tags to exclude from hierarchy (including tier tags)
+        # Tags to exclude from hierarchy
         system_tags = {
             'production',
-            'daily',
-            'hourly',
-            'weekly',
-            'monthly',
             'view',
             'table',
             'incremental',
             'staging',
-            'intermediate'
+            'intermediate',
+            # Granularity values (in case used as standalone tags)
+            'daily',
+            'weekly',
+            'monthly',
+            'hourly',
+            'latest',
+            'in_ranges',
+            'last_30d',
+            'last_7d',
+            'all_time'
         }
 
-        # Filter out system tags and tier tags (tier0, tier1, etc.)
+        # Filter out system tags, tier tags, and prefixed tags
         hierarchy_tags = []
         for t in dbt_tags:
             t_lower = t.lower()
+            # Skip system tags
             if t_lower in system_tags:
                 continue
+            # Skip tier tags (tier0, tier1, etc.)
             if re.match(r'^tier\d+$', t_lower):
+                continue
+            # Skip prefixed tags (api:, granularity:)
+            if ':' in t:
                 continue
             hierarchy_tags.append(t)
 
@@ -121,14 +236,27 @@ class DynamicRouter:
         columns = manifest.get_columns(model_name)
         dbt_tags = manifest.get_tags(model_name)
 
-        # Clean up URL path: remove 'api_' prefix and replace underscores with slashes
-        # e.g., api_consensus_validators_active_daily -> /consensus/validators/active/daily
-        clean_name = model_name
-        if clean_name.startswith("api_"):
-            clean_name = clean_name[4:]
+        # --- Build URL Path from Tags ---
+        url_path = self._build_url_path(model_name, dbt_tags, override)
+        
+        if not url_path:
+            print(f"⚠️ Skipping {model_name}: no valid URL path could be generated")
+            return
 
-        url_path = override.get("path", f"/{clean_name.replace('_', '/')}")
-        summary = override.get("summary", clean_name.replace("_", " ").title())
+        # --- Generate Summary ---
+        api_resource = self._extract_api_resource(dbt_tags)
+        granularity = self._extract_granularity(dbt_tags)
+        
+        if override.get("summary"):
+            summary = override["summary"]
+        elif api_resource:
+            # Build summary from resource and granularity
+            summary_parts = [api_resource.replace("_", " ").title()]
+            if granularity:
+                summary_parts.append(f"({granularity})")
+            summary = " ".join(summary_parts)
+        else:
+            summary = model_name.replace("_", " ").title()
 
         # --- Hierarchical Tag Grouping ---
         # Manual override takes precedence, otherwise derive from dbt tags
@@ -263,6 +391,8 @@ class DynamicRouter:
             tags=api_tags,
             name=model_name
         )
+
+        print(f"  ✅ {url_path} -> {model_name} [{required_tier}]")
 
 
 router = DynamicRouter().router

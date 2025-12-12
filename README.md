@@ -10,7 +10,7 @@ The service is built with **FastAPI** and features automatic route discovery bas
 
 - **Framework:** Python 3.11 + FastAPI (Async)
 - **Database:** ClickHouse (via `clickhouse-connect`)
-- **Routing:** Dynamic – endpoints are auto-generated from the dbt `manifest.json`
+- **Routing:** Dynamic — endpoints are auto-generated from the dbt `manifest.json`
 - **Documentation:** OpenAPI (Swagger UI) & ReDoc (auto-generated)
 - **Security:** Header-based API Key authentication (`X-API-Key`)
 - **Rate Limiting:** In-memory throttling per tier (Free/Pro/Unlimited) using `slowapi`
@@ -145,7 +145,7 @@ Higher tier users can access all endpoints at or below their tier level.
 
 ```bash
 curl -X 'GET' \
-  'http://localhost:8000/v1/consensus/validators/active?limit=5' \
+  'http://localhost:8000/v1/consensus/blob_commitments/daily?limit=5' \
   -H 'accept: application/json' \
   -H 'X-API-Key: sk_live_alice_abc123'
 ```
@@ -177,68 +177,119 @@ The API is **metadata-driven**. You do **not** need to write Python code to add 
 
 A dbt model will be exposed as an API endpoint if it meets **both** conditions:
 
-1. ✅ Model name starts with `api_` prefix
-2. ✅ Model has the `production` tag
+1. ✅ Model has the `production` tag
+2. ✅ Model has an `api:` tag defining the resource name
 
-### Tagging for Organization & Access Control
+### Tag Convention
 
-Use dbt tags to control:
-- **Swagger UI grouping** – First non-system tag becomes the section name
-- **Tier-based access** – Add `tier0`, `tier1`, `tier2`, or `tier3` tag
+Use dbt tags to control endpoint paths, Swagger UI grouping, and access control:
 
-**Example `schema.yml`:**
-
-```yaml
-models:
-  # Public endpoint - anyone can access
-  - name: api_consensus_validators_active
-    description: "Active validators list"
-    config:
-      tags: ["production", "consensus", "validators", "tier0"]
-
-  # Partner-only endpoint
-  - name: api_execution_transactions_detailed
-    description: "Detailed transaction data"
-    config:
-      tags: ["production", "execution", "transactions", "tier1"]
-
-  # Premium endpoint
-  - name: api_financial_treasury_daily
-    description: "Daily treasury stats"
-    config:
-      tags: ["production", "financial", "tier2"]
-
-  # Internal-only endpoint
-  - name: api_internal_metrics_raw
-    description: "Raw internal metrics"
-    config:
-      tags: ["production", "internal", "tier3"]
+```sql
+{{
+    config(
+        materialized='view',
+        tags=["production", "consensus", "tier1", "api:blob_commitments", "granularity:daily"]
+    )
+}}
 ```
+
+| Tag | Format | Purpose | Required |
+|-----|--------|---------|----------|
+| `production` | literal | Marks model for API exposure | ✅ Yes |
+| Category | `consensus`, `execution`, etc. | Swagger UI section & URL prefix | ✅ Yes |
+| Tier | `tier0`, `tier1`, `tier2`, `tier3` | Access control level | No (default: `tier0`) |
+| Resource | `api:{resource_name}` | Explicit resource name in URL | ✅ Yes |
+| Granularity | `granularity:{period}` | Time dimension suffix in URL | No |
+
+### URL Path Generation
+
+The URL path is built from tags: `/{category}/{resource}/{granularity?}`
+
+| Tags | Generated Path |
+|------|----------------|
+| `["production", "consensus", "api:blob_commitments", "granularity:daily"]` | `/consensus/blob_commitments/daily` |
+| `["production", "consensus", "api:blob_commitments", "granularity:latest"]` | `/consensus/blob_commitments/latest` |
+| `["production", "execution", "api:transactions"]` | `/execution/transactions` |
+| `["production", "financial", "tier2", "api:treasury"]` | `/financial/treasury` |
+
+### Complete Example
+
+**Model:** `api_consensus_blob_commitments_daily.sql`
+
+```sql
+{{
+    config(
+        materialized='view',
+        tags=["production", "consensus", "tier1", "api:blob_commitments", "granularity:daily"]
+    )
+}}
+
+SELECT
+    date,
+    total_blob_commitments AS value
+FROM {{ ref('int_consensus_blocks_daily') }}
+ORDER BY date
+```
+
+**Result:**
+- **Endpoint:** `GET /v1/consensus/blob_commitments/daily`
+- **Swagger Section:** `Consensus`
+- **Access:** `tier1` (Partner and above)
+
+### Multiple Granularities for Same Resource
+
+Create separate models for different time granularities:
+
+```sql
+-- api_consensus_blob_commitments_daily.sql
+{{ config(tags=["production", "consensus", "tier1", "api:blob_commitments", "granularity:daily"]) }}
+
+-- api_consensus_blob_commitments_latest.sql  
+{{ config(tags=["production", "consensus", "tier0", "api:blob_commitments", "granularity:latest"]) }}
+
+-- api_consensus_blob_commitments_last_30d.sql
+{{ config(tags=["production", "consensus", "tier1", "api:blob_commitments", "granularity:last_30d"]) }}
+
+-- api_consensus_blob_commitments_all_time.sql
+{{ config(tags=["production", "consensus", "tier2", "api:blob_commitments", "granularity:all_time"]) }}
+```
+
+**Generated Endpoints:**
+- `GET /v1/consensus/blob_commitments/daily` (tier1)
+- `GET /v1/consensus/blob_commitments/latest` (tier0)
+- `GET /v1/consensus/blob_commitments/last_30d` (tier1)
+- `GET /v1/consensus/blob_commitments/all_time` (tier2)
+
+### Supported Granularities
+
+| Granularity | Use Case |
+|-------------|----------|
+| `daily` | Daily aggregated data |
+| `weekly` | Weekly aggregated data |
+| `monthly` | Monthly aggregated data |
+| `latest` | Most recent value(s) only |
+| `last_7d` | Rolling 7-day window |
+| `last_30d` | Rolling 30-day window |
+| `in_ranges` | Data within specified ranges |
+| `all_time` | Complete historical data |
 
 ### Tags Reference
 
 | Tag Type | Examples | Purpose |
 |----------|----------|---------|
 | **Required** | `production` | Marks model for API exposure |
-| **Grouping** | `consensus`, `execution`, `financial` | First tag = Swagger UI section |
+| **Category** | `consensus`, `execution`, `financial` | First tag = Swagger UI section + URL prefix |
 | **Access** | `tier0`, `tier1`, `tier2`, `tier3` | Required tier level (default: `tier0`) |
-| **Ignored** | `daily`, `hourly`, `view`, `table` | Filtered out from grouping |
+| **Resource** | `api:blob_commitments`, `api:validators` | Explicit resource name in URL |
+| **Granularity** | `granularity:daily`, `granularity:weekly`, `granularity:monthly`, `granularity:latest`, `granularity:in_ranges`, `granularity:last_30d`, `granularity:last_7d`, `granularity:all_time` | Optional time/range suffix |
+| **Ignored** | `view`, `table`, `incremental` | Filtered out from URL/grouping |
 
 ### Workflow
 
-1. **Create Model** – Name it `api_<category>_<subcategory>_<name>.sql`
-2. **Add Tags** – Include `production` + category + tier in `schema.yml`
-3. **Deploy** – Merge PR, CI/CD updates `manifest.json`
-4. **Result** – API auto-discovers new endpoint on next restart
-
-**Example Result:**
-
-Model: `api_consensus_validators_active_daily.sql`
-Tags: `["production", "consensus", "validators", "tier0"]`
-
-→ **Endpoint:** `GET /v1/consensus/validators/active/daily`
-→ **Swagger Section:** `Consensus`
-→ **Access:** `tier0` (public)
+1. **Create Model** — Name it descriptively (e.g., `api_consensus_blob_commitments_daily.sql`)
+2. **Add Tags** — Include `production` + category + `api:resource` + optional `granularity:` + tier
+3. **Deploy** — Merge PR, CI/CD updates `manifest.json`
+4. **Result** — API auto-discovers new endpoint on next restart
 
 ---
 
