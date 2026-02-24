@@ -4,7 +4,7 @@ import re
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from app.database import ClickHouseClient
-from app.security import get_api_key, check_tier_access
+from app.security import get_api_key, get_optional_api_key, check_tier_access
 from app.manifest import manifest
 from app.config import settings
 
@@ -330,11 +330,14 @@ class DynamicRouter:
         endpoint_required_tier = required_tier
         endpoint_path = url_path
 
+        # tier0 endpoints are publicly accessible; tier1+ require an API key
+        auth_dependency = get_optional_api_key if endpoint_required_tier == "tier0" else get_api_key
+
         async def dynamic_handler(
             request: Request,
             limit: int = Query(100, ge=1, le=5000),
             offset: int = Query(0, ge=0),
-            user_info: Dict[str, Any] = Depends(get_api_key)
+            user_info: Dict[str, Any] = Depends(auth_dependency)
         ):
             # Check tier-based access control
             check_tier_access(user_info, endpoint_required_tier, endpoint_path)
@@ -377,7 +380,8 @@ class DynamicRouter:
         # --- Documentation Generation ---
         # Add column info and tier requirement to description
         col_doc = "\n".join([f"- **{k}**: {v}" for k, v in columns.items()])
-        tier_doc = f"**Required Access:** `{required_tier}`"
+        auth_note = " (no API key required)" if required_tier == "tier0" else ""
+        tier_doc = f"**Required Access:** `{required_tier}`{auth_note}"
         full_desc = f"{tier_doc}\n\n{dbt_node.get('description', '')}\n\n**Columns:**\n{col_doc}"
 
         dynamic_handler.__doc__ = full_desc

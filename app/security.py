@@ -75,6 +75,37 @@ def can_access_tier(user_tier: str, required_tier: str) -> bool:
     return user_level >= required_level
 
 
+ANONYMOUS_USER_INFO = {
+    "user": "anonymous",
+    "tier": "tier0",
+    "org": None,
+    "api_key": None,
+}
+
+
+async def get_optional_api_key(
+    api_key_header: str = Security(api_key_header),
+) -> Dict[str, Any]:
+    """
+    Optional API key validation for tier0 endpoints.
+    - No key provided: returns anonymous user_info (tier0 access).
+    - Valid key provided: validates and returns real user_info.
+    - Invalid key provided: raises 403.
+    """
+    if not api_key_header:
+        return ANONYMOUS_USER_INFO.copy()
+
+    if api_key_header in settings.API_KEYS:
+        user_info = settings.API_KEYS[api_key_header].copy()
+        user_info["api_key"] = api_key_header
+        return user_info
+
+    raise HTTPException(
+        status_code=403,
+        detail="Invalid API Key",
+    )
+
+
 async def get_api_key(api_key_header: str = Security(api_key_header)) -> Dict[str, Any]:
     """
     Verifies the API Key exists in the configuration.
