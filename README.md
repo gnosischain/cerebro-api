@@ -147,7 +147,7 @@ Higher tier users can access all endpoints at or below their tier level.
 
 ```bash
 curl -X 'GET' \
-  'http://localhost:8000/v1/consensus/blob_commitments/daily?limit=5' \
+  'http://localhost:8000/v1/consensus/blob_commitments/daily' \
   -H 'accept: application/json' \
   -H 'X-API-Key: sk_live_alice_abc123'
 ```
@@ -238,6 +238,134 @@ ORDER BY date
 - **Swagger Section:** `Consensus`
 - **Access:** `tier1` (Partner and above)
 
+### Strict Metadata Contract
+
+Endpoint behavior is now strict and metadata-only.
+
+- No inferred filters.
+- No inferred pagination.
+- No inferred sort.
+- `granularity:*` tags only affect the URL path segment.
+- Swagger route listing is deterministic: grouped by `/{category}/{resource}` then granularity priority (`none`, `latest`, `daily`, `weekly`, `monthly`, `last_7d`, `last_30d`, `in_ranges`, `all_time`, unknowns last).
+
+### Legacy vs Metadata-Driven Endpoints
+
+- Legacy endpoint (`production` + `api:*`, no `meta.api`):
+  - GET only
+  - no declared filters
+  - no pagination
+  - no sort
+  - full result returned
+  - any query params return `400`
+- Metadata-driven endpoint (`meta.api` present):
+  - filters, methods, pagination, and sort come only from `meta.api`
+  - undeclared query params or body fields return `400`
+  - `limit`/`offset` only work when pagination is enabled
+
+### `meta.api` Reference
+
+| Field | Type | Default | Description |
+|------|------|---------|-------------|
+| `methods` | list | `["GET"]` | Allowed HTTP methods (`GET`, `POST`) |
+| `allow_unfiltered` | bool | `false` | Allow requests with no declared business filters |
+| `require_any_of` | list | `[]` | At least one listed filter name must be present |
+| `parameters` | list | `[]` | Declared filter contract |
+| `pagination` | object | disabled | Enables `limit` and `offset` |
+| `sort` | list | `[]` | Explicit `ORDER BY` list |
+
+Parameter object fields:
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `name` | Yes | API field name used by clients |
+| `column` | Yes | Final projected model column to filter on |
+| `operator` | Yes | One of `=`, `>=`, `<=`, `ILIKE`, `IN` |
+| `type` | Yes | One of `string`, `date`, `string_list` |
+| `description` | No | OpenAPI description |
+| `case` | No | `lower` or `upper` (string and string_list only) |
+| `max_items` | No | Max list size (string_list only) |
+
+Pagination object fields:
+
+| Key | Required When Enabled | Description |
+|-----|------------------------|-------------|
+| `enabled` | Yes | Must be `true` to enable pagination |
+| `default_limit` | Yes | Default row limit when client omits `limit` |
+| `max_limit` | Yes | Hard upper bound for `limit` |
+
+Sort object fields:
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `column` | Yes | Column name present in final `SELECT` |
+| `direction` | Yes | `ASC` or `DESC` |
+
+### Metadata Example
+
+```sql
+{{
+    config(
+        materialized='view',
+        tags=['production', 'execution', 'tier1', 'api:token_balances', 'granularity:daily'],
+        meta={
+            "api": {
+                "methods": ["GET", "POST"],
+                "allow_unfiltered": false,
+                "require_any_of": ["symbol", "address"],
+                "parameters": [
+                    {"name": "symbol", "column": "symbol", "operator": "=", "type": "string"},
+                    {"name": "address", "column": "address", "operator": "IN", "type": "string_list", "case": "lower", "max_items": 200},
+                    {"name": "start_date", "column": "date", "operator": ">=", "type": "date"},
+                    {"name": "end_date", "column": "date", "operator": "<=", "type": "date"}
+                ],
+                "pagination": {"enabled": true, "default_limit": 100, "max_limit": 5000},
+                "sort": [{"column": "date", "direction": "DESC"}]
+            }
+        }
+    )
+}}
+```
+
+### Request Examples
+
+GET list filters accept repeated params and CSV:
+
+```bash
+curl "http://localhost:8000/v1/execution/token_balances/daily?symbol=ETH&address=0x1&address=0x2&limit=50" \
+  -H 'X-API-Key: sk_live_internal_admin'
+```
+
+```bash
+curl "http://localhost:8000/v1/execution/token_balances/daily?symbol=ETH&address=0x1,0x2&limit=50" \
+  -H 'X-API-Key: sk_live_internal_admin'
+```
+
+POST accepts only JSON body fields declared in metadata:
+
+```bash
+curl -X POST "http://localhost:8000/v1/execution/token_balances/daily" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: sk_live_internal_admin" \
+  -d '{
+    "symbol": "ETH",
+    "address": ["0x1", "0x2"],
+    "start_date": "2024-01-01",
+    "end_date": "2024-01-31",
+    "limit": 100,
+    "offset": 0
+  }'
+```
+
+### Authoring Guidance
+
+- Prefer thin API-facing dbt views over exposing heavy internal models directly.
+- Every `parameters[].column` and `sort[].column` must be present in the final `SELECT`.
+- Do not rely on `granularity:latest`, `daily`, or `all_time` for behavior. They only shape URL paths.
+- If you want date filters, declare them in `meta.api.parameters`.
+- If you want pagination, declare `meta.api.pagination`.
+- If you want ordering, declare `meta.api.sort`.
+- If you want POST, include `"POST"` in `meta.api.methods`.
+
 ### Multiple Granularities for Same Resource
 
 Create separate models for different time granularities:
@@ -290,8 +418,9 @@ Create separate models for different time granularities:
 
 1. **Create Model** — Name it descriptively (e.g., `api_consensus_blob_commitments_daily.sql`)
 2. **Add Tags** — Include `production` + category + `api:resource` + optional `granularity:` + tier
-3. **Deploy** — Merge PR, CI/CD updates `manifest.json`
-4. **Result** — API auto-discovers new endpoint on next restart
+3. **Add `meta.api`** — Define methods, filters, unfiltered policy, pagination, and sort
+4. **Deploy** — Merge PR, CI/CD updates `manifest.json`
+5. **Result** — API auto-discovers or updates the endpoint on the next manifest refresh
 
 ---
 
@@ -406,13 +535,14 @@ curl -X POST http://localhost:8000/v1/system/manifest/refresh \
 | `app/main.py` | FastAPI app initialization |
 | `app/config.py` | Settings & environment loading |
 | `app/database.py` | ClickHouse client wrapper |
+| `app/api_metadata.py` | dbt endpoint metadata parsing and validation |
 | `app/security.py` | Authentication & tier access control |
 | `app/manifest.py` | dbt manifest loader |
 | `app/factory.py` | Dynamic route generation engine |
 
 ### Adding Custom Endpoints
 
-For endpoints that can't be auto-generated, add them to `api_config.yaml`:
+`api_config.yaml` is now limited to route-level overrides only:
 
 ```yaml
 endpoints:
@@ -421,12 +551,15 @@ endpoints:
     summary: "Custom endpoint"
     tags: ["Custom"]
     tier: "tier1"
-    parameters:
-      - name: custom_param
-        column: column_name
-        operator: "="
-        type: string
 ```
+
+Behavior is never overridden from `api_config.yaml`.
+
+- filters come only from `meta.api.parameters`
+- methods come only from `meta.api.methods`
+- pagination comes only from `meta.api.pagination`
+- sort comes only from `meta.api.sort`
+- unfiltered policy comes only from `meta.api.allow_unfiltered` and `meta.api.require_any_of`
 
 ---
 

@@ -3,6 +3,7 @@ import threading
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI
 
+from app.api_metadata import ApiEndpointSpec
 from app.config import settings
 from app.factory import build_router
 from app.manifest import manifest
@@ -14,11 +15,13 @@ class RouterManager:
         self._lock = threading.Lock()
         self._dynamic_routes: List[Any] = []
         self._refresh_task: Optional[asyncio.Task] = None
+        self._last_good_specs_by_model: Dict[str, ApiEndpointSpec] = {}
 
     def install_initial_routes(self) -> None:
-        router = build_router()
+        router, specs, _warnings = build_router()
         with self._lock:
             self._swap_routes(router)
+            self._last_good_specs_by_model = specs
 
     def _swap_routes(self, router) -> None:
         # Capture current routes to isolate newly-added ones
@@ -42,8 +45,17 @@ class RouterManager:
             if not changed:
                 return {"status": "unchanged", "models": manifest.model_count()}
 
-            router = build_router()
+            try:
+                router, specs, _warnings = build_router(self._last_good_specs_by_model)
+            except Exception as exc:
+                return {
+                    "status": "error",
+                    "models": manifest.model_count(),
+                    "detail": str(exc),
+                }
+
             self._swap_routes(router)
+            self._last_good_specs_by_model = specs
             return {"status": "reloaded", "models": manifest.model_count()}
 
     async def refresh_async(self) -> Dict[str, Any]:
