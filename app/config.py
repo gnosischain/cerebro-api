@@ -76,9 +76,9 @@ class Settings(BaseSettings):
     DEFAULT_ENDPOINT_TIER: str = "tier0"
 
     TIER_RATE_LIMITS: Dict[str, int] = {
-        "tier0": 20,
-        "tier1": 100,
-        "tier2": 500,
+        "tier0": 100,
+        "tier1": 500,
+        "tier2": 1000,
         "tier3": 10000,
     }
 

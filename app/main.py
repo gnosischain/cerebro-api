@@ -30,9 +30,9 @@ Tier0 endpoints are publicly accessible without authentication.
 
 **Access Tiers:**
 
-    - tier0 → Public   (20/min, no key required)
-    - tier1 → Partner  (100/min)
-    - tier2 → Premium  (500/min)
+    - tier0 → Public   (100/min, no key required)
+    - tier1 → Partner  (500/min)
+    - tier2 → Premium  (1000/min)
     - tier3 → Internal (10k/min)
 """
 
