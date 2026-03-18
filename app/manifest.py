@@ -1,9 +1,16 @@
-import json
-import os
 import hashlib
+import json
+import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
-from typing import Dict, Any, Optional, List, Tuple
+
 from app.config import settings
+from app.observability import cerebro_api_manifest_models_loaded, log_event
+
+logger = logging.getLogger("cerebro_api.manifest")
+
 
 class ManifestLoader:
     _instance = None
@@ -30,11 +37,11 @@ class ManifestLoader:
         new_last_modified = None
         source = None
         self._last_error = None
-        
+
         # 1. Try URL first
         if settings.DBT_MANIFEST_URL:
             try:
-                print(f"🌐 Fetching manifest from {settings.DBT_MANIFEST_URL}...")
+                log_event(logger, "manifest_refresh", action="fetch_url")
                 headers = {}
                 if conditional:
                     if self._etag:
@@ -43,7 +50,7 @@ class ManifestLoader:
                         headers["If-Modified-Since"] = self._last_modified
                 response = requests.get(settings.DBT_MANIFEST_URL, timeout=30, headers=headers)
                 if response.status_code == 304:
-                    print("🔄 Manifest not modified (304).")
+                    log_event(logger, "manifest_refresh", action="not_modified_304")
                     return False
                 if response.status_code == 200:
                     raw_bytes = response.content
@@ -52,35 +59,35 @@ class ManifestLoader:
                         source = "url"
                         new_etag = response.headers.get("ETag")
                         new_last_modified = response.headers.get("Last-Modified")
-                        print("✅ Manifest downloaded successfully.")
+                        log_event(logger, "manifest_refresh", action="downloaded")
                     except Exception as e:
-                        msg = f"❌ Error parsing manifest JSON from URL: {e}"
+                        msg = f"Error parsing manifest JSON from URL: {e}"
                         errors.append(msg)
-                        print(msg)
+                        log_event(logger, "manifest_refresh", level=logging.ERROR, action="parse_error", error=msg)
                 else:
-                    msg = f"❌ Failed to download manifest: Status {response.status_code}"
+                    msg = f"Failed to download manifest: status {response.status_code}"
                     errors.append(msg)
-                    print(msg)
+                    log_event(logger, "manifest_refresh", level=logging.ERROR, action="http_error", status_code=response.status_code)
             except Exception as e:
-                msg = f"❌ Error fetching manifest URL: {e}"
+                msg = f"Error fetching manifest URL: {e}"
                 errors.append(msg)
-                print(msg)
+                log_event(logger, "manifest_refresh", level=logging.ERROR, action="fetch_error", error=str(e))
 
         # 2. Fallback to local file
         if not data and allow_fallback and os.path.exists(settings.DBT_MANIFEST_PATH):
             try:
-                print(f"📂 Loading manifest from local file: {settings.DBT_MANIFEST_PATH}")
-                with open(settings.DBT_MANIFEST_PATH, 'rb') as f:
+                log_event(logger, "manifest_refresh", action="load_file", path=settings.DBT_MANIFEST_PATH)
+                with open(settings.DBT_MANIFEST_PATH, "rb") as f:
                     raw_bytes = f.read()
                 data = json.loads(raw_bytes.decode("utf-8"))
                 source = "file"
             except Exception as e:
-                msg = f"❌ Error loading local manifest: {e}"
+                msg = f"Error loading local manifest: {e}"
                 errors.append(msg)
-                print(msg)
+                log_event(logger, "manifest_refresh", level=logging.ERROR, action="file_error", error=str(e))
 
         if not data:
-            print("⚠️ No manifest loaded. API will define routes but metadata will be missing.")
+            log_event(logger, "manifest_refresh", level=logging.WARNING, action="no_manifest_loaded")
             if errors:
                 self._last_error = " | ".join(errors)
             else:
@@ -102,7 +109,7 @@ class ManifestLoader:
                     self._etag = new_etag
                 if new_last_modified:
                     self._last_modified = new_last_modified
-            print("🔄 Manifest unchanged (hash match).")
+            log_event(logger, "manifest_refresh", action="unchanged_hash")
             return False
 
         # Index models
@@ -124,15 +131,12 @@ class ManifestLoader:
             self._last_modified = new_last_modified
 
         self._last_error = None
-        
-        print(f"✅ Loaded {len(self._models)} models from dbt manifest.")
+
+        log_event(logger, "manifest_refresh", action="loaded", model_count=len(self._models), source=source)
+        cerebro_api_manifest_models_loaded.set(len(self._models))
         return True
 
     def reload_if_changed(self) -> Tuple[bool, Optional[str]]:
-        """
-        Reload manifest only if the remote source has changed.
-        Returns (changed, error_message).
-        """
         changed = self._load_manifest(allow_fallback=False, conditional=True)
         if changed:
             return True, None
@@ -141,7 +145,6 @@ class ManifestLoader:
         return False, None
 
     def get_all_models(self) -> List[str]:
-        """Return a list of all model names."""
         return list(self._models.keys())
 
     def get_model(self, model_name: str) -> Optional[Dict[str, Any]]:
@@ -156,11 +159,10 @@ class ManifestLoader:
         return model_name
 
     def get_columns(self, model_name: str) -> Dict[str, str]:
-        """Returns a dict of column_name -> data_type"""
         node = self.get_model(model_name)
         if not node:
             return {}
-        
+
         cols = {}
         for col_name, col_meta in node.get("columns", {}).items():
             cols[col_name] = col_meta.get("data_type", "String")
@@ -174,5 +176,6 @@ class ManifestLoader:
 
     def model_count(self) -> int:
         return len(self._models)
+
 
 manifest = ManifestLoader()

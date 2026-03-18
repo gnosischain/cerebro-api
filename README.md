@@ -13,7 +13,8 @@ The service is built with **FastAPI** and features automatic route discovery bas
 - **Routing:** Dynamic — endpoints are auto-generated from the dbt `manifest.json`
 - **Documentation:** OpenAPI (Swagger UI) & ReDoc (auto-generated)
 - **Security:** Header-based API Key authentication (`X-API-Key`)
-- **Rate Limiting:** In-memory throttling per tier (Free/Pro/Unlimited) using `slowapi`
+- **Rate Limiting:** Tier-based per-pod in-memory throttling using `slowapi`
+- **Observability:** Structured JSON logging (stderr), Prometheus metrics (`/metrics`), Grafana dashboard
 
 ---
 
@@ -23,17 +24,29 @@ The service is built with **FastAPI** and features automatic route discovery bas
 /cerebro-api
 ├── Dockerfile               # Multi-stage Docker build definition
 ├── requirements.txt         # Python dependencies
+├── requirements-dev.txt     # Dev/test dependencies (pytest, httpx)
 ├── .env.example             # Template for environment variables
 ├── api_keys.json            # API keys configuration (git-ignored)
 ├── .gitignore               # Git ignore rules
-└── app
-    ├── main.py              # App entry point
-    ├── config.py            # Settings & Env var loading
-    ├── database.py          # ClickHouse client wrapper
-    ├── security.py          # Auth & Rate limiting logic
-    ├── manifest.py          # Logic to download & parse dbt manifest
-    └── factory.py           # ⚙️ The Engine: auto-generates routes
-````
+├── app/
+│   ├── server.py            # Process entrypoint (setup logging, start uvicorn)
+│   ├── main.py              # FastAPI app, middleware, system endpoints
+│   ├── observability.py     # JSON logging, Prometheus metrics, middleware
+│   ├── config.py            # Settings & env var loading
+│   ├── database.py          # ClickHouse client wrapper
+│   ├── security.py          # Auth resolution, access enforcement, rate limiting
+│   ├── manifest.py          # dbt manifest loader with structured logging
+│   ├── router_manager.py    # Dynamic route lifecycle & background refresh
+│   ├── factory.py           # Dynamic route generation engine
+│   └── api_metadata.py      # Endpoint spec parsing & validation
+└── tests/
+    ├── conftest.py           # Shared fixtures (mocked DB, manifest, API keys)
+    ├── test_endpoints.py     # /, /health, /metrics tests
+    ├── test_auth.py          # Auth resolution & tier access tests
+    ├── test_observability.py # JSON formatter, log_event, middleware tests
+    ├── test_rate_limiting.py # Rate limit enforcement & metrics tests
+    └── test_manifest.py      # Manifest refresh & router_manager tests
+```
 
 ---
 
@@ -117,14 +130,29 @@ Create an `api_keys.json` file in your project root:
 ### 5. Run the Server
 
 ```bash
-uvicorn app.main:app --reload
+python -m app.server
+```
+
+For development with auto-reload:
+
+```bash
+uvicorn app.main:app --reload --proxy-headers
 ```
 
 The API will be available at:
 
 * Root: `http://127.0.0.1:8000`
+* Health check: `http://127.0.0.1:8000/health`
+* Prometheus metrics: `http://127.0.0.1:8000/metrics`
 * Interactive Docs (Swagger UI): `http://127.0.0.1:8000/docs`
 * Alternative Docs (ReDoc): `http://127.0.0.1:8000/redoc`
+
+### 6. Run Tests
+
+```bash
+pip install -r requirements-dev.txt
+./venv/bin/pytest tests/
+```
 
 ---
 
@@ -424,6 +452,54 @@ Create separate models for different time granularities:
 
 ---
 
+## Observability
+
+The API emits structured JSON logs to stderr and exposes Prometheus metrics at `/metrics`.
+
+### Structured Logging
+
+All log output is JSON, one object per line, with fields: `timestamp`, `level`, `logger`, `message`, `event`, plus context-specific fields. Logs never contain raw API keys, SQL text, query parameters, or request bodies.
+
+Key log events:
+
+| Event | Description |
+|-------|-------------|
+| `http_request` | Every HTTP request (method, route, status, duration) |
+| `api_access_denied` | Auth failures (reason, required/provided tier) |
+| `api_rate_limit` | Rate-limit blocks (tier, identity kind) |
+| `clickhouse_query` | ClickHouse queries (category, resource, granularity, tier, row count, duration) |
+| `manifest_refresh` | Manifest reload lifecycle (trigger, status, model count) |
+| `route_install` | Dynamic route registration (path, model, tier, methods) |
+
+### Prometheus Metrics
+
+All metrics are prefixed with `cerebro_api_`. Key metric families:
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `http_requests_total` | Counter | method, route, status |
+| `http_request_duration_seconds` | Histogram | method, route |
+| `auth_resolutions_total` | Counter | required_tier, result |
+| `access_denied_total` | Counter | required_tier, provided_tier, reason |
+| `rate_limit_decisions_total` | Counter | tier, result, identity_kind |
+| `dynamic_requests_total` | Counter | category, resource, granularity, tier, method, status |
+| `dynamic_request_duration_seconds` | Histogram | category, resource, granularity, tier, method |
+| `clickhouse_query_duration_seconds` | Histogram | category, resource, granularity, tier, status |
+| `clickhouse_query_errors_total` | Counter | category, resource, granularity, tier |
+| `clickhouse_rows_returned` | Histogram | category, resource, granularity, tier |
+| `manifest_refresh_total` | Counter | trigger, status |
+| `manifest_models_loaded` | Gauge | — |
+| `dynamic_routes_registered` | Gauge | — |
+
+### Kubernetes Integration
+
+- **PodMonitor** scrapes `/metrics` on port `http` — Prometheus discovers pods directly
+- `/metrics` is blocked at the public ALB with a fixed-response 403 rule
+- K8s probes use `/health` (returns 200 when ClickHouse is reachable, 503 otherwise)
+- A dedicated Grafana dashboard (`cerebro-api-observability`) provides real-time visibility across traffic, auth, rate limits, dynamic API, ClickHouse, manifest lifecycle, pod resources, and structured logs
+
+---
+
 ## Deployment (Docker)
 
 This service is designed to run as a **stateless container** on Kubernetes.
@@ -532,13 +608,16 @@ curl -X POST http://localhost:8000/v1/system/manifest/refresh \
 
 | File | Purpose |
 |------|---------|
-| `app/main.py` | FastAPI app initialization |
+| `app/server.py` | Process entrypoint — sets up logging before app import |
+| `app/main.py` | FastAPI app, CORS, middleware, system endpoints (`/`, `/health`, `/metrics`) |
+| `app/observability.py` | JSON log formatter, Prometheus metrics, HTTP middleware, observer helpers |
 | `app/config.py` | Settings & environment loading |
 | `app/database.py` | ClickHouse client wrapper |
 | `app/api_metadata.py` | dbt endpoint metadata parsing and validation |
-| `app/security.py` | Authentication & tier access control |
-| `app/manifest.py` | dbt manifest loader |
-| `app/factory.py` | Dynamic route generation engine |
+| `app/security.py` | Auth resolution, access enforcement, rate-limit helpers |
+| `app/manifest.py` | dbt manifest loader with structured logging and model gauge |
+| `app/router_manager.py` | Dynamic route lifecycle, background refresh, manifest refresh metrics |
+| `app/factory.py` | Dynamic route generation engine with instrumentation |
 
 ### Adding Custom Endpoints
 

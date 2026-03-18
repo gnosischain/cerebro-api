@@ -54,6 +54,9 @@ class ApiEndpointSpec:
     sort: List[ApiSortSpec]
     description: str
     metadata_enabled: bool = False
+    category: str = "general"
+    resource: str = "unknown"
+    granularity: str = "none"
 
 
 @dataclass(frozen=True)

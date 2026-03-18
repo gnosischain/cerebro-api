@@ -1,12 +1,18 @@
 import asyncio
+import logging
 import threading
-from typing import Optional, List, Dict, Any
+import time
+from typing import Any, Dict, List, Optional
+
 from fastapi import FastAPI
 
 from app.api_metadata import ApiEndpointSpec
 from app.config import settings
 from app.factory import build_router
 from app.manifest import manifest
+from app.observability import log_event, observe_manifest_refresh
+
+logger = logging.getLogger("cerebro_api.router")
 
 
 class RouterManager:
@@ -18,13 +24,23 @@ class RouterManager:
         self._last_good_specs_by_model: Dict[str, ApiEndpointSpec] = {}
 
     def install_initial_routes(self) -> None:
+        started = time.perf_counter()
         router, specs, _warnings = build_router()
         with self._lock:
             self._swap_routes(router)
             self._last_good_specs_by_model = specs
+        elapsed = time.perf_counter() - started
+        observe_manifest_refresh("startup", "reloaded", elapsed)
+        log_event(
+            logger, "manifest_refresh",
+            trigger="startup",
+            status="reloaded",
+            models=manifest.model_count(),
+            routes=len(specs),
+            duration_seconds=round(elapsed, 4),
+        )
 
     def _swap_routes(self, router) -> None:
-        # Capture current routes to isolate newly-added ones
         before_ids = {id(r) for r in self.app.router.routes}
         self.app.include_router(router, prefix="/v1")
         added = [r for r in self.app.router.routes if id(r) not in before_ids]
@@ -37,17 +53,42 @@ class RouterManager:
         self._dynamic_routes = added
         self.app.openapi_schema = None
 
-    def refresh_sync(self) -> Dict[str, Any]:
+    def refresh_sync(self, trigger: str = "background") -> Dict[str, Any]:
+        started = time.perf_counter()
         with self._lock:
             changed, error = manifest.reload_if_changed()
             if error:
+                elapsed = time.perf_counter() - started
+                observe_manifest_refresh(trigger, "error", elapsed)
+                log_event(
+                    logger, "manifest_refresh",
+                    level=logging.ERROR,
+                    trigger=trigger,
+                    status="error",
+                    detail=error,
+                    duration_seconds=round(elapsed, 4),
+                    success=False,
+                )
                 return {"status": "error", "models": manifest.model_count(), "detail": error}
             if not changed:
+                elapsed = time.perf_counter() - started
+                observe_manifest_refresh(trigger, "unchanged", elapsed)
                 return {"status": "unchanged", "models": manifest.model_count()}
 
             try:
                 router, specs, _warnings = build_router(self._last_good_specs_by_model)
             except Exception as exc:
+                elapsed = time.perf_counter() - started
+                observe_manifest_refresh(trigger, "error", elapsed)
+                log_event(
+                    logger, "manifest_refresh",
+                    level=logging.ERROR,
+                    trigger=trigger,
+                    status="error",
+                    detail=str(exc),
+                    duration_seconds=round(elapsed, 4),
+                    success=False,
+                )
                 return {
                     "status": "error",
                     "models": manifest.model_count(),
@@ -56,10 +97,20 @@ class RouterManager:
 
             self._swap_routes(router)
             self._last_good_specs_by_model = specs
+            elapsed = time.perf_counter() - started
+            observe_manifest_refresh(trigger, "reloaded", elapsed)
+            log_event(
+                logger, "manifest_refresh",
+                trigger=trigger,
+                status="reloaded",
+                models=manifest.model_count(),
+                routes=len(specs),
+                duration_seconds=round(elapsed, 4),
+            )
             return {"status": "reloaded", "models": manifest.model_count()}
 
-    async def refresh_async(self) -> Dict[str, Any]:
-        return await asyncio.to_thread(self.refresh_sync)
+    async def refresh_async(self, trigger: str = "background") -> Dict[str, Any]:
+        return await asyncio.to_thread(self.refresh_sync, trigger)
 
     def start_background_refresh(self) -> None:
         if not settings.DBT_MANIFEST_REFRESH_ENABLED:
@@ -71,7 +122,7 @@ class RouterManager:
             try:
                 while True:
                     await asyncio.sleep(settings.DBT_MANIFEST_REFRESH_INTERVAL_SECONDS)
-                    await self.refresh_async()
+                    await self.refresh_async(trigger="background")
             except asyncio.CancelledError:
                 return
 

@@ -1,12 +1,15 @@
 import json
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import ConfigDict, Field, create_model
+from slowapi.util import get_remote_address
 
 from app.api_metadata import (
     ApiEndpointSpec,
@@ -20,7 +23,21 @@ from app.api_metadata import (
 from app.config import settings
 from app.database import ClickHouseClient
 from app.manifest import manifest
-from app.security import check_tier_access, get_api_key, get_optional_api_key
+from app.observability import (
+    cerebro_api_dynamic_routes_registered,
+    log_event,
+    observe_clickhouse_query,
+    observe_dynamic_request,
+)
+from app.security import (
+    enforce_access,
+    get_tier_rate_limit,
+    limiter,
+    observe_rate_limit_allowed,
+    resolve_request_identity,
+)
+
+logger = logging.getLogger("cerebro_api.factory")
 
 LEGACY_PARAM_ERROR = (
     "This endpoint does not declare API parameters. "
@@ -73,10 +90,10 @@ class DynamicRouter:
         unsupported = sorted(set(raw_override.keys()) - MANUAL_OVERRIDE_KEYS)
         if unsupported:
             warning = (
-                f"⚠️ {model_name}: ignoring unsupported api_config override keys: "
+                f"{model_name}: ignoring unsupported api_config override keys: "
                 f"{', '.join(unsupported)}"
             )
-            print(warning)
+            log_event(logger, "route_install", level=logging.WARNING, detail=warning)
             self.warnings.append(warning)
 
         override = {key: raw_override[key] for key in MANUAL_OVERRIDE_KEYS if key in raw_override}
@@ -113,21 +130,9 @@ class DynamicRouter:
 
     def _extract_category(self, dbt_tags: List[str]) -> str:
         system_tags = {
-            "production",
-            "view",
-            "table",
-            "incremental",
-            "staging",
-            "intermediate",
-            "daily",
-            "weekly",
-            "monthly",
-            "hourly",
-            "latest",
-            "in_ranges",
-            "last_30d",
-            "last_7d",
-            "all_time",
+            "production", "view", "table", "incremental", "staging",
+            "intermediate", "daily", "weekly", "monthly", "hourly",
+            "latest", "in_ranges", "last_30d", "last_7d", "all_time",
         }
 
         for tag in dbt_tags:
@@ -164,21 +169,9 @@ class DynamicRouter:
 
     def _get_hierarchical_tags(self, dbt_tags: List[str]) -> List[str]:
         system_tags = {
-            "production",
-            "view",
-            "table",
-            "incremental",
-            "staging",
-            "intermediate",
-            "daily",
-            "weekly",
-            "monthly",
-            "hourly",
-            "latest",
-            "in_ranges",
-            "last_30d",
-            "last_7d",
-            "all_time",
+            "production", "view", "table", "incremental", "staging",
+            "intermediate", "daily", "weekly", "monthly", "hourly",
+            "latest", "in_ranges", "last_30d", "last_7d", "all_time",
         }
 
         hierarchy_tags = []
@@ -286,6 +279,11 @@ class DynamicRouter:
         tags = override.get("tags") or self._get_hierarchical_tags(dbt_tags)
         tier = override.get("tier", self._get_required_tier(dbt_tags))
         summary = self._get_summary(model_name, dbt_tags, override)
+
+        category = self._extract_category(dbt_tags)
+        resource = self._extract_api_resource(dbt_tags) or "unknown"
+        granularity = self._extract_granularity(dbt_tags) or "none"
+
         description = self._build_description(
             dbt_node=dbt_node,
             spec_tier=tier,
@@ -311,6 +309,9 @@ class DynamicRouter:
             sort=behavior.sort,
             description=description,
             metadata_enabled=behavior.metadata_enabled,
+            category=category,
+            resource=resource,
+            granularity=granularity,
         )
 
     def _parse_route_path(self, path: str) -> Optional[Tuple[str, str, Optional[str]]]:
@@ -326,7 +327,6 @@ class DynamicRouter:
     def _spec_sort_key(self, spec: ApiEndpointSpec) -> Tuple[int, str, str, int, str, str]:
         parsed = self._parse_route_path(spec.path)
         if parsed is None:
-            # Custom or unexpected paths fall back to lexical path ordering.
             return (1, "", "", 0, "", spec.path)
 
         category, resource, granularity = parsed
@@ -348,27 +348,30 @@ class DynamicRouter:
             if self._extract_api_resource(tags) is not None:
                 models_to_expose.add(model_name)
 
-        print(f"📡 Discovered {len(models_to_expose)} models with 'production' + 'api:' tags")
+        log_event(
+            logger, "route_install",
+            discovered_models=len(models_to_expose),
+        )
 
         manual_endpoints = self.manual_config.get("endpoints", []) or []
         manual_map: Dict[str, Dict[str, Any]] = {}
         for entry in manual_endpoints:
             if not isinstance(entry, dict) or "model" not in entry:
-                warning = "⚠️ Invalid api_config endpoint entry: missing model"
-                print(warning)
+                warning = "Invalid api_config endpoint entry: missing model"
+                log_event(logger, "route_install", level=logging.WARNING, detail=warning)
                 self.warnings.append(warning)
                 continue
             model_name = entry["model"]
             if not isinstance(model_name, str) or not model_name.strip():
-                warning = "⚠️ Invalid api_config endpoint entry: model must be a non-empty string"
-                print(warning)
+                warning = "Invalid api_config endpoint entry: model must be a non-empty string"
+                log_event(logger, "route_install", level=logging.WARNING, detail=warning)
                 self.warnings.append(warning)
                 continue
             try:
                 manual_map[model_name] = self._sanitize_manual_override(model_name, entry)
             except ApiMetadataError as exc:
-                warning = f"⚠️ {exc}. Override ignored."
-                print(warning)
+                warning = f"{exc}. Override ignored."
+                log_event(logger, "route_install", level=logging.WARNING, detail=warning)
                 self.warnings.append(warning)
 
         all_models = models_to_expose | set(manual_map.keys())
@@ -377,8 +380,8 @@ class DynamicRouter:
         for model_name in sorted(all_models):
             dbt_node = manifest.get_model(model_name)
             if not dbt_node:
-                warning = f"⚠️ Skipping {model_name}: model not found in manifest"
-                print(warning)
+                warning = f"Skipping {model_name}: model not found in manifest"
+                log_event(logger, "route_install", level=logging.WARNING, detail=warning)
                 self.warnings.append(warning)
                 continue
 
@@ -388,13 +391,13 @@ class DynamicRouter:
             except ApiMetadataError as exc:
                 cached_spec = self.previous_specs.get(model_name)
                 if cached_spec:
-                    warning = f"⚠️ {exc}. Reusing last known good endpoint for {model_name}."
-                    print(warning)
+                    warning = f"{exc}. Reusing last known good endpoint for {model_name}."
+                    log_event(logger, "route_install", level=logging.WARNING, detail=warning)
                     self.warnings.append(warning)
                     spec = cached_spec
                 else:
-                    warning = f"⚠️ {exc}. Endpoint skipped."
-                    print(warning)
+                    warning = f"{exc}. Endpoint skipped."
+                    log_event(logger, "route_install", level=logging.WARNING, detail=warning)
                     self.warnings.append(warning)
                     continue
 
@@ -404,8 +407,8 @@ class DynamicRouter:
         for spec in sorted(specs_to_register, key=self._spec_sort_key):
             self._register_endpoint(spec)
 
-    def _get_auth_dependency(self, required_tier: str):
-        return get_optional_api_key if required_tier == "tier0" else get_api_key
+        # Update gauges
+        cerebro_api_dynamic_routes_registered.set(len(specs_to_register))
 
     def _normalize_scalar_value(self, param: ApiParamSpec, value: Any) -> Optional[str]:
         if value is None:
@@ -662,7 +665,6 @@ class DynamicRouter:
         parsed_request: ParsedRequest,
         user_info: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        check_tier_access(user_info, spec.tier, spec.path)
         self._enforce_filter_policy(spec, parsed_request)
 
         sql = f"SELECT * FROM {spec.table_name}"
@@ -701,11 +703,54 @@ class DynamicRouter:
             query_params["limit"] = parsed_request.limit
             query_params["offset"] = parsed_request.offset
 
+        tier = user_info.get("tier", "tier0")
+        ch_start = time.perf_counter()
         try:
-            return ClickHouseClient.query(sql, query_params)
+            rows = ClickHouseClient.query(sql, query_params)
+            ch_elapsed = time.perf_counter() - ch_start
+            observe_clickhouse_query(
+                category=spec.category,
+                resource=spec.resource,
+                granularity=spec.granularity,
+                tier=tier,
+                status="ok",
+                elapsed_seconds=ch_elapsed,
+                row_count=len(rows),
+            )
+            log_event(
+                logger, "clickhouse_query",
+                category=spec.category,
+                resource=spec.resource,
+                granularity=spec.granularity,
+                tier=tier,
+                row_count=len(rows),
+                duration_seconds=round(ch_elapsed, 4),
+                success=True,
+            )
+            return rows
         except HTTPException:
             raise
         except Exception as exc:
+            ch_elapsed = time.perf_counter() - ch_start
+            observe_clickhouse_query(
+                category=spec.category,
+                resource=spec.resource,
+                granularity=spec.granularity,
+                tier=tier,
+                status="error",
+                elapsed_seconds=ch_elapsed,
+            )
+            log_event(
+                logger, "clickhouse_query",
+                level=logging.ERROR,
+                category=spec.category,
+                resource=spec.resource,
+                granularity=spec.granularity,
+                tier=tier,
+                duration_seconds=round(ch_elapsed, 4),
+                error=str(exc),
+                success=False,
+            )
             raise HTTPException(status_code=500, detail=str(exc))
 
     def _build_get_openapi_parameters(self, spec: ApiEndpointSpec) -> List[Dict[str, Any]]:
@@ -803,24 +848,53 @@ class DynamicRouter:
         )
 
     def _register_endpoint(self, spec: ApiEndpointSpec) -> None:
-        auth_dependency = self._get_auth_dependency(spec.tier)
+        # Dependencies: resolve identity first, then enforce access
+        identity_dep = resolve_request_identity
+        access_dep = enforce_access(spec.tier)
 
         async def get_handler(
             request: Request,
-            user_info: Dict[str, Any] = Depends(auth_dependency),
+            _identity=Depends(identity_dep),
+            user_info: Dict[str, Any] = Depends(access_dep),
         ):
-            parsed_request = self._parse_get_request(spec, request)
-            return self._execute_dynamic_query(spec, parsed_request, user_info)
+            # Set endpoint context for middleware logging
+            request.state.endpoint_category = spec.category
+            request.state.endpoint_resource = spec.resource
+            request.state.endpoint_granularity = spec.granularity
+
+            started = time.perf_counter()
+            try:
+                parsed_request = self._parse_get_request(spec, request)
+                result = self._execute_dynamic_query(spec, parsed_request, user_info)
+                elapsed = time.perf_counter() - started
+                observe_dynamic_request(
+                    category=spec.category, resource=spec.resource,
+                    granularity=spec.granularity, tier=user_info.get("tier", "tier0"),
+                    method="GET", status="200", elapsed_seconds=elapsed,
+                )
+                observe_rate_limit_allowed(request)
+                return result
+            except HTTPException as exc:
+                elapsed = time.perf_counter() - started
+                observe_dynamic_request(
+                    category=spec.category, resource=spec.resource,
+                    granularity=spec.granularity, tier=user_info.get("tier", "tier0"),
+                    method="GET", status=str(exc.status_code), elapsed_seconds=elapsed,
+                )
+                raise
 
         get_handler.__doc__ = spec.description
+        get_handler.__name__ = f"{spec.model_name}_get"
 
         openapi_parameters = self._build_get_openapi_parameters(spec)
         openapi_extra = {"parameters": openapi_parameters} if openapi_parameters else None
 
         if "GET" in spec.methods:
+            # Apply rate limiting via decorator
+            limited_get = limiter.limit(get_tier_rate_limit, key_func=get_rate_limit_key)(get_handler)
             self.router.add_api_route(
                 path=spec.path,
-                endpoint=get_handler,
+                endpoint=limited_get,
                 methods=["GET"],
                 summary=spec.summary,
                 description=spec.description,
@@ -836,22 +910,47 @@ class DynamicRouter:
             async def post_handler(
                 request: Request,
                 _body: body_type = Body(default=None),
-                user_info: Dict[str, Any] = Depends(auth_dependency),
+                _identity=Depends(identity_dep),
+                user_info: Dict[str, Any] = Depends(access_dep),
             ):
+                request.state.endpoint_category = spec.category
+                request.state.endpoint_resource = spec.resource
+                request.state.endpoint_granularity = spec.granularity
+
                 if request.query_params:
                     raise HTTPException(
                         status_code=400,
                         detail="POST endpoints accept filter and pagination fields in JSON body only.",
                     )
 
-                payload = await self._read_json_payload(request)
-                parsed_request = self._parse_post_request(spec, payload)
-                return self._execute_dynamic_query(spec, parsed_request, user_info)
+                started = time.perf_counter()
+                try:
+                    payload = await self._read_json_payload(request)
+                    parsed_request = self._parse_post_request(spec, payload)
+                    result = self._execute_dynamic_query(spec, parsed_request, user_info)
+                    elapsed = time.perf_counter() - started
+                    observe_dynamic_request(
+                        category=spec.category, resource=spec.resource,
+                        granularity=spec.granularity, tier=user_info.get("tier", "tier0"),
+                        method="POST", status="200", elapsed_seconds=elapsed,
+                    )
+                    observe_rate_limit_allowed(request)
+                    return result
+                except HTTPException as exc:
+                    elapsed = time.perf_counter() - started
+                    observe_dynamic_request(
+                        category=spec.category, resource=spec.resource,
+                        granularity=spec.granularity, tier=user_info.get("tier", "tier0"),
+                        method="POST", status=str(exc.status_code), elapsed_seconds=elapsed,
+                    )
+                    raise
 
             post_handler.__doc__ = spec.description
+            post_handler.__name__ = f"{spec.model_name}_post"
+            limited_post = limiter.limit(get_tier_rate_limit, key_func=get_rate_limit_key)(post_handler)
             self.router.add_api_route(
                 path=spec.path,
-                endpoint=post_handler,
+                endpoint=limited_post,
                 methods=["POST"],
                 summary=f"{spec.summary} (POST)",
                 description=spec.description,
@@ -860,7 +959,21 @@ class DynamicRouter:
             )
 
         methods = ", ".join(spec.methods)
-        print(f"  ✅ {spec.path} -> {spec.model_name} [{spec.tier}] ({methods})")
+        log_event(
+            logger, "route_install",
+            path=spec.path,
+            model=spec.model_name,
+            tier=spec.tier,
+            methods=methods,
+            category=spec.category,
+            resource=spec.resource,
+            granularity=spec.granularity,
+        )
+
+
+def get_rate_limit_key(request: Request) -> str:
+    """Key function for SlowAPI that uses resolved identity."""
+    return getattr(request.state, "rate_limit_key", get_remote_address(request))
 
 
 def build_router(
