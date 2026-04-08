@@ -7,6 +7,7 @@ ALLOWED_OPERATORS = {"=", ">=", "<=", "ILIKE", "IN"}
 ALLOWED_TYPES = {"string", "date", "string_list"}
 ALLOWED_CASE_MODES = {"lower", "upper"}
 ALLOWED_SORT_DIRECTIONS = {"ASC", "DESC"}
+ALLOWED_PAGINATION_RESPONSE_MODES = {"list", "envelope"}
 
 
 class ApiMetadataError(ValueError):
@@ -30,6 +31,7 @@ class ApiPaginationSpec:
     enabled: bool
     default_limit: Optional[int] = None
     max_limit: Optional[int] = None
+    response_mode: str = "list"
 
 
 @dataclass(frozen=True)
@@ -211,6 +213,16 @@ def _normalize_pagination(model_name: str, raw_pagination: Any) -> ApiPagination
 
     default_limit = raw_pagination.get("default_limit")
     max_limit = raw_pagination.get("max_limit")
+    response_mode = raw_pagination.get("response", "list")
+
+    if not isinstance(response_mode, str):
+        raise ApiMetadataError(f"{model_name}: api.pagination.response must be a string")
+    response_mode = response_mode.strip().lower()
+    if response_mode not in ALLOWED_PAGINATION_RESPONSE_MODES:
+        joined = ", ".join(sorted(ALLOWED_PAGINATION_RESPONSE_MODES))
+        raise ApiMetadataError(
+            f"{model_name}: api.pagination.response must be one of {joined}"
+        )
 
     if enabled:
         if (
@@ -237,6 +249,7 @@ def _normalize_pagination(model_name: str, raw_pagination: Any) -> ApiPagination
         enabled=enabled,
         default_limit=default_limit,
         max_limit=max_limit,
+        response_mode=response_mode,
     )
 
 

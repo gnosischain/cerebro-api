@@ -65,6 +65,13 @@ class ParsedRequest:
     offset: Optional[int] = None
 
 
+@dataclass
+class QueryExecutionResult:
+    items: List[Dict[str, Any]]
+    returned: int
+    has_more: Optional[bool] = None
+
+
 class DynamicRouter:
     def __init__(self, previous_specs: Optional[Dict[str, ApiEndpointSpec]] = None):
         self.router = APIRouter()
@@ -659,12 +666,15 @@ class DynamicRouter:
             return ""
         return ", ".join([f"{item.column} {item.direction}" for item in spec.sort])
 
+    def _uses_envelope_pagination(self, spec: ApiEndpointSpec) -> bool:
+        return spec.pagination.enabled and spec.pagination.response_mode == "envelope"
+
     def _execute_dynamic_query(
         self,
         spec: ApiEndpointSpec,
         parsed_request: ParsedRequest,
         user_info: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
+    ) -> QueryExecutionResult:
         self._enforce_filter_policy(spec, parsed_request)
 
         sql = f"SELECT * FROM {spec.table_name}"
@@ -700,13 +710,30 @@ class DynamicRouter:
             if parsed_request.limit is None or parsed_request.offset is None:
                 raise HTTPException(status_code=500, detail="Pagination values are missing.")
             sql += " LIMIT %(limit)s OFFSET %(offset)s"
-            query_params["limit"] = parsed_request.limit
+            query_limit = parsed_request.limit
+            if self._uses_envelope_pagination(spec):
+                query_limit += 1
+            query_params["limit"] = query_limit
             query_params["offset"] = parsed_request.offset
 
         tier = user_info.get("tier", "tier0")
         ch_start = time.perf_counter()
         try:
             rows = ClickHouseClient.query(sql, query_params)
+            if self._uses_envelope_pagination(spec):
+                if parsed_request.limit is None:
+                    raise HTTPException(status_code=500, detail="Pagination values are missing.")
+                has_more = len(rows) > parsed_request.limit
+                items = rows[:parsed_request.limit]
+            else:
+                has_more = None
+                items = rows
+
+            result = QueryExecutionResult(
+                items=items,
+                returned=len(items),
+                has_more=has_more,
+            )
             ch_elapsed = time.perf_counter() - ch_start
             observe_clickhouse_query(
                 category=spec.category,
@@ -715,7 +742,7 @@ class DynamicRouter:
                 tier=tier,
                 status="ok",
                 elapsed_seconds=ch_elapsed,
-                row_count=len(rows),
+                row_count=result.returned,
             )
             log_event(
                 logger, "clickhouse_query",
@@ -723,11 +750,11 @@ class DynamicRouter:
                 resource=spec.resource,
                 granularity=spec.granularity,
                 tier=tier,
-                row_count=len(rows),
+                row_count=result.returned,
                 duration_seconds=round(ch_elapsed, 4),
                 success=True,
             )
-            return rows
+            return result
         except HTTPException:
             raise
         except Exception as exc:
@@ -752,6 +779,28 @@ class DynamicRouter:
                 success=False,
             )
             raise HTTPException(status_code=500, detail=str(exc))
+
+    def _build_response_payload(
+        self,
+        spec: ApiEndpointSpec,
+        parsed_request: ParsedRequest,
+        query_result: QueryExecutionResult,
+    ) -> Any:
+        if not self._uses_envelope_pagination(spec):
+            return query_result.items
+
+        if parsed_request.limit is None or parsed_request.offset is None:
+            raise HTTPException(status_code=500, detail="Pagination values are missing.")
+
+        return {
+            "items": query_result.items,
+            "pagination": {
+                "limit": parsed_request.limit,
+                "offset": parsed_request.offset,
+                "returned": query_result.returned,
+                "has_more": bool(query_result.has_more),
+            },
+        }
 
     def _build_get_openapi_parameters(self, spec: ApiEndpointSpec) -> List[Dict[str, Any]]:
         parameters = []
@@ -809,6 +858,52 @@ class DynamicRouter:
 
         return parameters
 
+    def _build_envelope_openapi_responses(self) -> Dict[str, Any]:
+        return {
+            "200": {
+                "description": "Paginated response",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["items", "pagination"],
+                            "properties": {
+                                "items": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": True,
+                                    },
+                                },
+                                "pagination": {
+                                    "type": "object",
+                                    "required": ["limit", "offset", "returned", "has_more"],
+                                    "properties": {
+                                        "limit": {"type": "integer", "minimum": 1},
+                                        "offset": {"type": "integer", "minimum": 0},
+                                        "returned": {"type": "integer", "minimum": 0},
+                                        "has_more": {"type": "boolean"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+        }
+
+    def _build_openapi_extra(
+        self,
+        spec: ApiEndpointSpec,
+        parameters: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        openapi_extra: Dict[str, Any] = {}
+        if parameters:
+            openapi_extra["parameters"] = parameters
+        if self._uses_envelope_pagination(spec):
+            openapi_extra["responses"] = self._build_envelope_openapi_responses()
+        return openapi_extra or None
+
     def _create_post_body_model(self, spec: ApiEndpointSpec):
         model_fields: Dict[str, Any] = {}
         for param in spec.parameters:
@@ -865,7 +960,8 @@ class DynamicRouter:
             started = time.perf_counter()
             try:
                 parsed_request = self._parse_get_request(spec, request)
-                result = self._execute_dynamic_query(spec, parsed_request, user_info)
+                query_result = self._execute_dynamic_query(spec, parsed_request, user_info)
+                response_payload = self._build_response_payload(spec, parsed_request, query_result)
                 elapsed = time.perf_counter() - started
                 observe_dynamic_request(
                     category=spec.category, resource=spec.resource,
@@ -873,7 +969,7 @@ class DynamicRouter:
                     method="GET", status="200", elapsed_seconds=elapsed,
                 )
                 observe_rate_limit_allowed(request)
-                return result
+                return response_payload
             except HTTPException as exc:
                 elapsed = time.perf_counter() - started
                 observe_dynamic_request(
@@ -887,7 +983,7 @@ class DynamicRouter:
         get_handler.__name__ = f"{spec.model_name}_get"
 
         openapi_parameters = self._build_get_openapi_parameters(spec)
-        openapi_extra = {"parameters": openapi_parameters} if openapi_parameters else None
+        get_openapi_extra = self._build_openapi_extra(spec, openapi_parameters)
 
         if "GET" in spec.methods:
             # Apply rate limiting via decorator
@@ -900,7 +996,7 @@ class DynamicRouter:
                 description=spec.description,
                 tags=spec.tags,
                 name=f"{spec.model_name}_get",
-                openapi_extra=openapi_extra,
+                openapi_extra=get_openapi_extra,
             )
 
         if "POST" in spec.methods:
@@ -927,7 +1023,8 @@ class DynamicRouter:
                 try:
                     payload = await self._read_json_payload(request)
                     parsed_request = self._parse_post_request(spec, payload)
-                    result = self._execute_dynamic_query(spec, parsed_request, user_info)
+                    query_result = self._execute_dynamic_query(spec, parsed_request, user_info)
+                    response_payload = self._build_response_payload(spec, parsed_request, query_result)
                     elapsed = time.perf_counter() - started
                     observe_dynamic_request(
                         category=spec.category, resource=spec.resource,
@@ -935,7 +1032,7 @@ class DynamicRouter:
                         method="POST", status="200", elapsed_seconds=elapsed,
                     )
                     observe_rate_limit_allowed(request)
-                    return result
+                    return response_payload
                 except HTTPException as exc:
                     elapsed = time.perf_counter() - started
                     observe_dynamic_request(
@@ -956,6 +1053,7 @@ class DynamicRouter:
                 description=spec.description,
                 tags=spec.tags,
                 name=f"{spec.model_name}_post",
+                openapi_extra=self._build_openapi_extra(spec),
             )
 
         methods = ", ".join(spec.methods)
