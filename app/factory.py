@@ -316,6 +316,7 @@ class DynamicRouter:
             sort=behavior.sort,
             description=description,
             metadata_enabled=behavior.metadata_enabled,
+            exclude_from_api=behavior.exclude_from_api,
             category=category,
             resource=resource,
             granularity=granularity,
@@ -407,6 +408,17 @@ class DynamicRouter:
                     log_event(logger, "route_install", level=logging.WARNING, detail=warning)
                     self.warnings.append(warning)
                     continue
+
+            if spec.exclude_from_api:
+                warning = f"Skipping {model_name}: excluded from API via meta.api.exclude_from_api."
+                log_event(
+                    logger, "route_install",
+                    level=logging.WARNING,
+                    model=model_name,
+                    detail=warning,
+                )
+                self.warnings.append(warning)
+                continue
 
             self.valid_specs[model_name] = spec
             specs_to_register.append(spec)

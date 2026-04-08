@@ -159,6 +159,46 @@ class DynamicRouteHarness:
 
 
 class TestPaginationMetadata:
+    def test_exclude_from_api_defaults_to_false(self):
+        behavior = build_api_behavior(
+            "api_example",
+            {"validator_index": "UInt32"},
+            True,
+            {
+                "methods": ["GET"],
+                "allow_unfiltered": True,
+            },
+        )
+
+        assert behavior.exclude_from_api is False
+
+    def test_exclude_from_api_accepts_true(self):
+        behavior = build_api_behavior(
+            "api_example",
+            {"validator_index": "UInt32"},
+            True,
+            {
+                "methods": ["GET"],
+                "allow_unfiltered": True,
+                "exclude_from_api": True,
+            },
+        )
+
+        assert behavior.exclude_from_api is True
+
+    def test_exclude_from_api_rejects_non_boolean(self):
+        with pytest.raises(ApiMetadataError, match="api.exclude_from_api must be a boolean"):
+            build_api_behavior(
+                "api_example",
+                {"validator_index": "UInt32"},
+                True,
+                {
+                    "methods": ["GET"],
+                    "allow_unfiltered": True,
+                    "exclude_from_api": "yes",
+                },
+            )
+
     def test_pagination_response_defaults_to_list(self):
         behavior = build_api_behavior(
             "api_example",
@@ -337,3 +377,66 @@ class TestEnvelopePaginationRoutes:
                 "returned",
                 "has_more",
             }
+
+
+class TestExcludedDynamicRoutes:
+    def _models(self) -> dict[str, dict]:
+        visible_api = deepcopy(VALIDATOR_API)
+        hidden_api = deepcopy(VALIDATOR_API)
+        hidden_api["exclude_from_api"] = True
+
+        return {
+            "api_consensus_visible_latest": _make_model_entry(
+                "api_consensus_visible_latest",
+                ["production", "consensus", "tier1", "api:visible_validators", "granularity:latest"],
+                visible_api,
+            ),
+            "api_consensus_hidden_latest": _make_model_entry(
+                "api_consensus_hidden_latest",
+                ["production", "consensus", "tier1", "api:hidden_validators", "granularity:latest"],
+                hidden_api,
+            ),
+        }
+
+    def test_excluded_model_is_not_registered_and_returns_404(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            openapi = harness.app.openapi()
+            hidden_response = harness.client.get(
+                "/v1/consensus/hidden_validators/latest",
+                headers={"X-API-Key": "test-key-tier1"},
+            )
+            visible_response = harness.client.get(
+                "/v1/consensus/visible_validators/latest",
+                headers={"X-API-Key": "test-key-tier1"},
+                params={"withdrawal_credentials": "0xabc"},
+            )
+
+        assert "/v1/consensus/hidden_validators/latest" not in openapi["paths"]
+        assert "/v1/consensus/visible_validators/latest" in openapi["paths"]
+        assert hidden_response.status_code == 404
+        assert visible_response.status_code == 200
+
+    def test_excluded_model_is_skipped_on_rebuild_even_with_previous_specs(self):
+        visible_api = deepcopy(VALIDATOR_API)
+        excluded_api = deepcopy(VALIDATOR_API)
+        excluded_api["exclude_from_api"] = True
+
+        model_name = "api_consensus_hidden_latest"
+        tags = ["production", "consensus", "tier1", "api:hidden_validators", "granularity:latest"]
+
+        with patch("app.factory.manifest", _build_manifest_mock({
+            model_name: _make_model_entry(model_name, tags, visible_api),
+        })):
+            _router, previous_specs, _warnings = build_router()
+
+        assert model_name in previous_specs
+
+        with patch("app.factory.manifest", _build_manifest_mock({
+            model_name: _make_model_entry(model_name, tags, excluded_api),
+        })):
+            rebuilt_router, rebuilt_specs, rebuilt_warnings = build_router(previous_specs=previous_specs)
+
+        route_paths = {route.path for route in rebuilt_router.routes}
+        assert model_name not in rebuilt_specs
+        assert "/consensus/hidden_validators/latest" not in route_paths
+        assert any("excluded from API via meta.api.exclude_from_api" in warning for warning in rebuilt_warnings)

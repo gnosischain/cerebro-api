@@ -286,7 +286,7 @@ Endpoint behavior is now strict and metadata-only.
   - full result returned
   - any query params return `400`
 - Metadata-driven endpoint (`meta.api` present):
-  - filters, methods, pagination, and sort come only from `meta.api`
+  - filters, methods, pagination, sort, and exclusion come only from `meta.api`
   - undeclared query params or body fields return `400`
   - `limit`/`offset` only work when pagination is enabled
 
@@ -297,6 +297,7 @@ Endpoint behavior is now strict and metadata-only.
 | `methods` | list | `["GET"]` | Allowed HTTP methods (`GET`, `POST`) |
 | `allow_unfiltered` | bool | `false` | Allow requests with no declared business filters |
 | `require_any_of` | list | `[]` | At least one listed filter name must be present |
+| `exclude_from_api` | bool | `false` | Skip route registration entirely so the endpoint is absent from the API/docs and requests return `404` |
 | `parameters` | list | `[]` | Declared filter contract |
 | `pagination` | object | disabled | Enables `limit` and `offset` |
 | `sort` | list | `[]` | Explicit `ORDER BY` list |
@@ -340,6 +341,7 @@ Sort object fields:
                 "methods": ["GET", "POST"],
                 "allow_unfiltered": false,
                 "require_any_of": ["symbol", "address"],
+                "exclude_from_api": false,
                 "parameters": [
                     {"name": "symbol", "column": "symbol", "operator": "=", "type": "string"},
                     {"name": "address", "column": "address", "operator": "IN", "type": "string_list", "case": "lower", "max_items": 200},
@@ -639,6 +641,7 @@ Behavior is never overridden from `api_config.yaml`.
 - pagination comes only from `meta.api.pagination`
 - sort comes only from `meta.api.sort`
 - unfiltered policy comes only from `meta.api.allow_unfiltered` and `meta.api.require_any_of`
+- exclusion comes only from `meta.api.exclude_from_api`
 
 ---
 

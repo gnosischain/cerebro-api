@@ -56,6 +56,7 @@ class ApiEndpointSpec:
     sort: List[ApiSortSpec]
     description: str
     metadata_enabled: bool = False
+    exclude_from_api: bool = False
     category: str = "general"
     resource: str = "unknown"
     granularity: str = "none"
@@ -70,6 +71,7 @@ class ApiBehaviorConfig:
     parameters: List[ApiParamSpec]
     pagination: ApiPaginationSpec
     sort: List[ApiSortSpec]
+    exclude_from_api: bool = False
 
 
 def extract_raw_api_metadata(dbt_node: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
@@ -305,6 +307,7 @@ def build_api_behavior(
             parameters=[],
             pagination=ApiPaginationSpec(enabled=False),
             sort=[],
+            exclude_from_api=False,
         )
 
     methods_raw = raw_api.get("methods", ["GET"])
@@ -326,6 +329,10 @@ def build_api_behavior(
     allow_unfiltered = raw_api.get("allow_unfiltered", False)
     if not isinstance(allow_unfiltered, bool):
         raise ApiMetadataError(f"{model_name}: api.allow_unfiltered must be a boolean")
+
+    exclude_from_api = raw_api.get("exclude_from_api", False)
+    if not isinstance(exclude_from_api, bool):
+        raise ApiMetadataError(f"{model_name}: api.exclude_from_api must be a boolean")
 
     require_any_of_raw = raw_api.get("require_any_of", [])
     if not isinstance(require_any_of_raw, list):
@@ -366,4 +373,5 @@ def build_api_behavior(
         parameters=parameters,
         pagination=pagination,
         sort=sort,
+        exclude_from_api=exclude_from_api,
     )
