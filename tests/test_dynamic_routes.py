@@ -64,6 +64,16 @@ VALIDATOR_API = {
     ],
 }
 
+SORTABLE_FIELDS = [
+    "validator_index",
+    "balance",
+    "effective_balance",
+    "status",
+    "activation_epoch",
+    "exit_epoch",
+    "withdrawable_epoch",
+]
+
 
 def _make_rows(count: int) -> list[dict]:
     return [
@@ -159,6 +169,74 @@ class DynamicRouteHarness:
 
 
 class TestPaginationMetadata:
+    def test_sortable_fields_default_to_empty(self):
+        behavior = build_api_behavior(
+            "api_example",
+            {"validator_index": "UInt32"},
+            True,
+            {
+                "methods": ["GET"],
+                "allow_unfiltered": True,
+            },
+        )
+
+        assert behavior.sortable_fields == []
+
+    def test_sortable_fields_accepts_valid_columns(self):
+        behavior = build_api_behavior(
+            "api_example",
+            {"validator_index": "UInt32", "balance": "UInt64"},
+            True,
+            {
+                "methods": ["GET"],
+                "allow_unfiltered": True,
+                "sortable_fields": ["balance", "validator_index"],
+            },
+        )
+
+        assert behavior.sortable_fields == ["balance", "validator_index"]
+
+    def test_sortable_fields_rejects_unknown_column(self):
+        with pytest.raises(ApiMetadataError, match="api.sortable_fields\\[0\\] uses unknown column"):
+            build_api_behavior(
+                "api_example",
+                {"validator_index": "UInt32"},
+                True,
+                {
+                    "methods": ["GET"],
+                    "allow_unfiltered": True,
+                    "sortable_fields": ["balance"],
+                },
+            )
+
+    def test_sortable_fields_reject_non_list_or_invalid_entries(self):
+        with pytest.raises(ApiMetadataError, match="api.sortable_fields must be a list"):
+            build_api_behavior(
+                "api_example",
+                {"validator_index": "UInt32"},
+                True,
+                {
+                    "methods": ["GET"],
+                    "allow_unfiltered": True,
+                    "sortable_fields": "validator_index",
+                },
+            )
+
+        with pytest.raises(
+            ApiMetadataError,
+            match="api.sortable_fields\\[0\\] must be a non-empty string",
+        ):
+            build_api_behavior(
+                "api_example",
+                {"validator_index": "UInt32"},
+                True,
+                {
+                    "methods": ["GET"],
+                    "allow_unfiltered": True,
+                    "sortable_fields": [1],
+                },
+            )
+
     def test_exclude_from_api_defaults_to_false(self):
         behavior = build_api_behavior(
             "api_example",
@@ -440,3 +518,144 @@ class TestExcludedDynamicRoutes:
         assert model_name not in rebuilt_specs
         assert "/consensus/hidden_validators/latest" not in route_paths
         assert any("excluded from API via meta.api.exclude_from_api" in warning for warning in rebuilt_warnings)
+
+
+class TestUserControlledSortingRoutes:
+    def _models(self) -> dict[str, dict]:
+        sortable_api = deepcopy(VALIDATOR_API)
+        sortable_api["sortable_fields"] = deepcopy(SORTABLE_FIELDS)
+        sortable_api["pagination"]["response"] = "envelope"
+        plain_api = deepcopy(VALIDATOR_API)
+
+        return {
+            "api_consensus_validators_status_latest": _make_model_entry(
+                "api_consensus_validators_status_latest",
+                ["production", "consensus", "tier1", "api:validators_status", "granularity:latest"],
+                sortable_api,
+            ),
+            "api_consensus_validators_status_daily": _make_model_entry(
+                "api_consensus_validators_status_daily",
+                ["production", "consensus", "tier1", "api:validators_status", "granularity:daily"],
+                plain_api,
+            ),
+        }
+
+    def test_get_user_sort_applies_primary_order_by_and_tie_breaker(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            response = harness.client.get(
+                "/v1/consensus/validators_status/latest",
+                headers={"X-API-Key": "test-key-tier1"},
+                params={
+                    "withdrawal_credentials": "0xabc",
+                    "sort_by": "balance",
+                    "sort_direction": "DESC",
+                },
+            )
+
+        assert response.status_code == 200
+        sql = harness.mock_query.call_args.args[0]
+        assert "ORDER BY balance DESC, validator_index ASC" in sql
+
+    def test_post_user_sort_defaults_direction_to_asc(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            response = harness.client.post(
+                "/v1/consensus/validators_status/latest",
+                headers={"X-API-Key": "test-key-tier1"},
+                json={
+                    "withdrawal_credentials": "0xabc",
+                    "sort_by": "exit_epoch",
+                },
+            )
+
+        assert response.status_code == 200
+        sql = harness.mock_query.call_args.args[0]
+        assert "ORDER BY exit_epoch ASC, validator_index ASC" in sql
+
+    def test_user_sort_does_not_duplicate_static_sort_when_same_column(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            response = harness.client.post(
+                "/v1/consensus/validators_status/latest",
+                headers={"X-API-Key": "test-key-tier1"},
+                json={
+                    "withdrawal_credentials": "0xabc",
+                    "sort_by": "validator_index",
+                    "sort_direction": "DESC",
+                },
+            )
+
+        assert response.status_code == 200
+        sql = harness.mock_query.call_args.args[0]
+        assert "ORDER BY validator_index DESC" in sql
+        assert "ORDER BY validator_index DESC, validator_index ASC" not in sql
+
+    def test_invalid_sort_inputs_return_400(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            invalid_direction = harness.client.get(
+                "/v1/consensus/validators_status/latest",
+                headers={"X-API-Key": "test-key-tier1"},
+                params={
+                    "withdrawal_credentials": "0xabc",
+                    "sort_by": "balance",
+                    "sort_direction": "DOWN",
+                },
+            )
+            missing_sort_by = harness.client.post(
+                "/v1/consensus/validators_status/latest",
+                headers={"X-API-Key": "test-key-tier1"},
+                json={
+                    "withdrawal_credentials": "0xabc",
+                    "sort_direction": "DESC",
+                },
+            )
+            unsupported_sort_by = harness.client.get(
+                "/v1/consensus/validators_status/latest",
+                headers={"X-API-Key": "test-key-tier1"},
+                params={
+                    "withdrawal_credentials": "0xabc",
+                    "sort_by": "slot",
+                },
+            )
+
+        assert invalid_direction.status_code == 400
+        assert invalid_direction.json()["detail"] == "'sort_direction' must be ASC or DESC."
+        assert missing_sort_by.status_code == 400
+        assert missing_sort_by.json()["detail"] == "'sort_direction' requires 'sort_by'."
+        assert unsupported_sort_by.status_code == 400
+        assert unsupported_sort_by.json()["detail"] == (
+            "'sort_by' must be one of: "
+            "validator_index, balance, effective_balance, status, activation_epoch, exit_epoch, withdrawable_epoch."
+        )
+
+    def test_endpoint_without_sortable_fields_rejects_user_sort(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            response = harness.client.get(
+                "/v1/consensus/validators_status/daily",
+                headers={"X-API-Key": "test-key-tier1"},
+                params={
+                    "withdrawal_credentials": "0xabc",
+                    "sort_by": "balance",
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "This endpoint does not support user-controlled sorting."
+
+    def test_openapi_documents_sort_inputs_only_for_sortable_endpoints(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            openapi = harness.app.openapi()
+
+        latest_get = openapi["paths"]["/v1/consensus/validators_status/latest"]["get"]
+        daily_get = openapi["paths"]["/v1/consensus/validators_status/daily"]["get"]
+        latest_param_names = {param["name"] for param in latest_get["parameters"]}
+        daily_param_names = {param["name"] for param in daily_get["parameters"]}
+
+        latest_post_schema = openapi["components"]["schemas"]["api_consensus_validators_status_latest_PostBody"]
+        daily_post_schema = openapi["components"]["schemas"]["api_consensus_validators_status_daily_PostBody"]
+
+        assert {"sort_by", "sort_direction"} <= latest_param_names
+        assert "sort_by" not in daily_param_names
+        assert "sort_direction" not in daily_param_names
+        assert latest_post_schema["properties"]["sort_by"]["enum"] == SORTABLE_FIELDS
+        assert latest_post_schema["properties"]["sort_direction"]["enum"] == ["ASC", "DESC"]
+        assert "sort_by" not in daily_post_schema["properties"]
+        assert "sort_direction" not in daily_post_schema["properties"]

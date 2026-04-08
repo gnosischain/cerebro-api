@@ -54,6 +54,7 @@ class ApiEndpointSpec:
     parameters: List[ApiParamSpec]
     pagination: ApiPaginationSpec
     sort: List[ApiSortSpec]
+    sortable_fields: List[str]
     description: str
     metadata_enabled: bool = False
     exclude_from_api: bool = False
@@ -71,6 +72,7 @@ class ApiBehaviorConfig:
     parameters: List[ApiParamSpec]
     pagination: ApiPaginationSpec
     sort: List[ApiSortSpec]
+    sortable_fields: List[str]
     exclude_from_api: bool = False
 
 
@@ -292,6 +294,40 @@ def _normalize_sort(
     return normalized
 
 
+def _normalize_sortable_fields(
+    model_name: str,
+    columns: Dict[str, str],
+    raw_sortable_fields: Any,
+) -> List[str]:
+    if raw_sortable_fields is None:
+        return []
+    if not isinstance(raw_sortable_fields, list):
+        raise ApiMetadataError(f"{model_name}: api.sortable_fields must be a list")
+
+    normalized: List[str] = []
+    seen_fields = set()
+    column_names = set(columns.keys())
+
+    for index, raw_field in enumerate(raw_sortable_fields):
+        if not isinstance(raw_field, str) or not raw_field.strip():
+            raise ApiMetadataError(
+                f"{model_name}: api.sortable_fields[{index}] must be a non-empty string"
+            )
+
+        field = raw_field.strip()
+        if field not in column_names:
+            raise ApiMetadataError(
+                f"{model_name}: api.sortable_fields[{index}] uses unknown column '{field}'"
+            )
+        if field in seen_fields:
+            continue
+
+        normalized.append(field)
+        seen_fields.add(field)
+
+    return normalized
+
+
 def build_api_behavior(
     model_name: str,
     columns: Dict[str, str],
@@ -307,6 +343,7 @@ def build_api_behavior(
             parameters=[],
             pagination=ApiPaginationSpec(enabled=False),
             sort=[],
+            sortable_fields=[],
             exclude_from_api=False,
         )
 
@@ -364,6 +401,11 @@ def build_api_behavior(
 
     pagination = _normalize_pagination(model_name, raw_api.get("pagination"))
     sort = _normalize_sort(model_name, columns, raw_api.get("sort", []))
+    sortable_fields = _normalize_sortable_fields(
+        model_name,
+        columns,
+        raw_api.get("sortable_fields", []),
+    )
 
     return ApiBehaviorConfig(
         metadata_enabled=True,
@@ -373,5 +415,6 @@ def build_api_behavior(
         parameters=parameters,
         pagination=pagination,
         sort=sort,
+        sortable_fields=sortable_fields,
         exclude_from_api=exclude_from_api,
     )

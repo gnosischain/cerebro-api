@@ -63,6 +63,8 @@ class ParsedRequest:
     provided_business_filters: Set[str]
     limit: Optional[int] = None
     offset: Optional[int] = None
+    sort_by: Optional[str] = None
+    sort_direction: Optional[str] = None
 
 
 @dataclass
@@ -244,6 +246,17 @@ class DynamicRouter:
             return ""
         return "\n".join([f"- `{item.column} {item.direction}`" for item in sort])
 
+    def _build_sortable_fields_doc(self, sortable_fields: List[str]) -> str:
+        if not sortable_fields:
+            return ""
+        fields = ", ".join([f"`{field}`" for field in sortable_fields])
+        return "\n".join(
+            [
+                f"- **sort_by**: one of {fields}",
+                "- **sort_direction**: `ASC` or `DESC` (defaults to `ASC` when `sort_by` is provided)",
+            ]
+        )
+
     def _build_description(
         self,
         dbt_node: Dict[str, Any],
@@ -252,6 +265,7 @@ class DynamicRouter:
         parameters: List[ApiParamSpec],
         pagination: ApiPaginationSpec,
         sort: List[ApiSortSpec],
+        sortable_fields: List[str],
         columns: Dict[str, str],
     ) -> str:
         auth_note = " (no API key required)" if spec_tier == "tier0" else ""
@@ -265,6 +279,10 @@ class DynamicRouter:
             description_parts.append(f"**Pagination:**\n{self._build_pagination_doc(pagination)}")
         if metadata_enabled and sort:
             description_parts.append(f"**Sort:**\n{self._build_sort_doc(sort)}")
+        if metadata_enabled and sortable_fields:
+            description_parts.append(
+                f"**User Sort:**\n{self._build_sortable_fields_doc(sortable_fields)}"
+            )
         description_parts.append(f"**Columns:**\n{column_doc}")
 
         return "\n\n".join(part for part in description_parts if part)
@@ -298,6 +316,7 @@ class DynamicRouter:
             parameters=behavior.parameters,
             pagination=behavior.pagination,
             sort=behavior.sort,
+            sortable_fields=behavior.sortable_fields,
             columns=columns,
         )
 
@@ -314,6 +333,7 @@ class DynamicRouter:
             parameters=behavior.parameters,
             pagination=behavior.pagination,
             sort=behavior.sort,
+            sortable_fields=behavior.sortable_fields,
             description=description,
             metadata_enabled=behavior.metadata_enabled,
             exclude_from_api=behavior.exclude_from_api,
@@ -564,6 +584,7 @@ class DynamicRouter:
             return ParsedRequest(filters={}, provided_business_filters=set(), limit=None, offset=None)
 
         allowed_names = {param.name for param in spec.parameters}
+        allowed_names.update({"sort_by", "sort_direction"})
         if spec.pagination.enabled:
             allowed_names.update({"limit", "offset"})
 
@@ -590,11 +611,18 @@ class DynamicRouter:
             provided_business_filters.add(param.name)
 
         limit, offset = self._parse_get_pagination(spec, request)
+        sort_by, sort_direction = self._parse_sort_request(
+            spec,
+            request.query_params.get("sort_by"),
+            request.query_params.get("sort_direction"),
+        )
         return ParsedRequest(
             filters=filters,
             provided_business_filters=provided_business_filters,
             limit=limit,
             offset=offset,
+            sort_by=sort_by,
+            sort_direction=sort_direction,
         )
 
     def _parse_post_request(
@@ -603,6 +631,7 @@ class DynamicRouter:
         payload: Dict[str, Any],
     ) -> ParsedRequest:
         allowed_names = {param.name for param in spec.parameters}
+        allowed_names.update({"sort_by", "sort_direction"})
         if spec.pagination.enabled:
             allowed_names.update({"limit", "offset"})
 
@@ -624,11 +653,18 @@ class DynamicRouter:
             provided_business_filters.add(param.name)
 
         limit, offset = self._parse_post_pagination(spec, payload)
+        sort_by, sort_direction = self._parse_sort_request(
+            spec,
+            payload.get("sort_by"),
+            payload.get("sort_direction"),
+        )
         return ParsedRequest(
             filters=filters,
             provided_business_filters=provided_business_filters,
             limit=limit,
             offset=offset,
+            sort_by=sort_by,
+            sort_direction=sort_direction,
         )
 
     async def _read_json_payload(self, request: Request) -> Dict[str, Any]:
@@ -673,10 +709,84 @@ class DynamicRouter:
             return f"upper({param.column})"
         return param.column
 
-    def _build_order_by_clause(self, spec: ApiEndpointSpec) -> str:
-        if not spec.sort:
+    def _normalize_sort_field_name(self, raw_value: Any, field_name: str) -> str:
+        if isinstance(raw_value, (list, tuple, dict)) or raw_value is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{field_name}' must be a non-empty string.",
+            )
+        value = str(raw_value).strip()
+        if not value:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{field_name}' must be a non-empty string.",
+            )
+        return value
+
+    def _parse_sort_request(
+        self,
+        spec: ApiEndpointSpec,
+        raw_sort_by: Any,
+        raw_sort_direction: Any,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        if raw_sort_by is None:
+            if raw_sort_direction is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="'sort_direction' requires 'sort_by'.",
+                )
+            return None, None
+
+        if not spec.sortable_fields:
+            raise HTTPException(
+                status_code=400,
+                detail="This endpoint does not support user-controlled sorting.",
+            )
+
+        sort_by = self._normalize_sort_field_name(raw_sort_by, "sort_by")
+        if sort_by not in spec.sortable_fields:
+            allowed = ", ".join(spec.sortable_fields)
+            raise HTTPException(
+                status_code=400,
+                detail=f"'sort_by' must be one of: {allowed}.",
+            )
+
+        if raw_sort_direction is None:
+            return sort_by, "ASC"
+        if isinstance(raw_sort_direction, (list, tuple, dict)):
+            raise HTTPException(
+                status_code=400,
+                detail="'sort_direction' must be ASC or DESC.",
+            )
+
+        sort_direction = str(raw_sort_direction).strip().upper()
+        if sort_direction not in {"ASC", "DESC"}:
+            raise HTTPException(
+                status_code=400,
+                detail="'sort_direction' must be ASC or DESC.",
+            )
+
+        return sort_by, sort_direction
+
+    def _build_order_by_clause(
+        self,
+        spec: ApiEndpointSpec,
+        parsed_request: ParsedRequest,
+    ) -> str:
+        order_items: List[ApiSortSpec]
+        if parsed_request.sort_by and parsed_request.sort_direction:
+            order_items = [
+                ApiSortSpec(column=parsed_request.sort_by, direction=parsed_request.sort_direction)
+            ]
+            order_items.extend(
+                item for item in spec.sort if item.column != parsed_request.sort_by
+            )
+        else:
+            order_items = spec.sort
+
+        if not order_items:
             return ""
-        return ", ".join([f"{item.column} {item.direction}" for item in spec.sort])
+        return ", ".join([f"{item.column} {item.direction}" for item in order_items])
 
     def _uses_envelope_pagination(self, spec: ApiEndpointSpec) -> bool:
         return spec.pagination.enabled and spec.pagination.response_mode == "envelope"
@@ -714,7 +824,7 @@ class DynamicRouter:
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
 
-        order_by = self._build_order_by_clause(spec)
+        order_by = self._build_order_by_clause(spec, parsed_request)
         if order_by:
             sql += f" ORDER BY {order_by}"
 
@@ -868,6 +978,33 @@ class DynamicRouter:
                 }
             )
 
+        if spec.sortable_fields:
+            parameters.append(
+                {
+                    "name": "sort_by",
+                    "in": "query",
+                    "required": False,
+                    "description": "Sort column",
+                    "schema": {
+                        "type": "string",
+                        "enum": spec.sortable_fields,
+                    },
+                }
+            )
+            parameters.append(
+                {
+                    "name": "sort_direction",
+                    "in": "query",
+                    "required": False,
+                    "description": "Sort direction. Defaults to ASC when sort_by is provided.",
+                    "schema": {
+                        "type": "string",
+                        "enum": ["ASC", "DESC"],
+                        "default": "ASC",
+                    },
+                }
+            )
+
         return parameters
 
     def _build_envelope_openapi_responses(self) -> Dict[str, Any]:
@@ -945,6 +1082,24 @@ class DynamicRouter:
             model_fields["offset"] = (
                 Optional[int],
                 Field(default=0, ge=0, description="Row offset"),
+            )
+
+        if spec.sortable_fields:
+            model_fields["sort_by"] = (
+                Optional[str],
+                Field(
+                    default=None,
+                    description="Sort column",
+                    json_schema_extra={"enum": spec.sortable_fields},
+                ),
+            )
+            model_fields["sort_direction"] = (
+                Optional[str],
+                Field(
+                    default=None,
+                    description="Sort direction. Defaults to ASC when sort_by is provided.",
+                    json_schema_extra={"enum": ["ASC", "DESC"]},
+                ),
             )
 
         safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", spec.model_name)
