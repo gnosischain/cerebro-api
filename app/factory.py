@@ -137,6 +137,14 @@ class DynamicRouter:
                     return granularity
         return None
 
+    def _extract_window(self, dbt_tags: List[str]) -> Optional[str]:
+        for tag in dbt_tags:
+            if tag.startswith("window:"):
+                window = tag[7:].strip().lower()
+                if window:
+                    return window
+        return None
+
     def _extract_category(self, dbt_tags: List[str]) -> str:
         system_tags = {
             "production", "view", "table", "incremental", "staging",
@@ -170,10 +178,13 @@ class DynamicRouter:
 
         category = self._extract_category(dbt_tags)
         granularity = self._extract_granularity(dbt_tags)
+        window = self._extract_window(dbt_tags)
 
         path_parts = [category, api_resource]
         if granularity:
             path_parts.append(granularity)
+        if window:
+            path_parts.append(window)
         return "/" + "/".join(path_parts)
 
     def _get_hierarchical_tags(self, dbt_tags: List[str]) -> List[str]:
@@ -215,10 +226,13 @@ class DynamicRouter:
 
         api_resource = self._extract_api_resource(dbt_tags)
         granularity = self._extract_granularity(dbt_tags)
+        window = self._extract_window(dbt_tags)
         if api_resource:
             parts = [api_resource.replace("_", " ").title()]
             if granularity:
                 parts.append(f"({granularity})")
+            if window:
+                parts.append(f"[{window}]")
             return " ".join(parts)
         return model_name.replace("_", " ").title()
 
@@ -308,6 +322,7 @@ class DynamicRouter:
         category = self._extract_category(dbt_tags)
         resource = self._extract_api_resource(dbt_tags) or "unknown"
         granularity = self._extract_granularity(dbt_tags) or "none"
+        window = self._extract_window(dbt_tags) or "none"
 
         description = self._build_description(
             dbt_node=dbt_node,
@@ -340,6 +355,7 @@ class DynamicRouter:
             category=category,
             resource=resource,
             granularity=granularity,
+            window=window,
         )
 
     def _parse_route_path(self, path: str) -> Optional[Tuple[str, str, Optional[str]]]:
@@ -349,6 +365,10 @@ class DynamicRouter:
             return category, resource, None
         if len(parts) == 3:
             category, resource, granularity = parts
+            return category, resource, granularity
+        if len(parts) == 4:
+            # /{category}/{resource}/{granularity}/{window} — window not needed for sorting
+            category, resource, granularity, _window = parts
             return category, resource, granularity
         return None
 

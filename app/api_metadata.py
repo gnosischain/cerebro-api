@@ -61,6 +61,7 @@ class ApiEndpointSpec:
     category: str = "general"
     resource: str = "unknown"
     granularity: str = "none"
+    window: str = "none"
 
 
 @dataclass(frozen=True)
