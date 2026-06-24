@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -62,6 +62,7 @@ class ApiEndpointSpec:
     resource: str = "unknown"
     granularity: str = "none"
     window: str = "none"
+    columns_detail: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

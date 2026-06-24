@@ -183,7 +183,7 @@ class DynamicRouter:
         path_parts = [category, api_resource]
         if granularity:
             path_parts.append(granularity)
-        if window:
+        if window and window != granularity:
             path_parts.append(window)
         return "/" + "/".join(path_parts)
 
@@ -231,7 +231,7 @@ class DynamicRouter:
             parts = [api_resource.replace("_", " ").title()]
             if granularity:
                 parts.append(f"({granularity})")
-            if window:
+            if window and window != granularity:
                 parts.append(f"[{window}]")
             return " ".join(parts)
         return model_name.replace("_", " ").title()
@@ -280,11 +280,19 @@ class DynamicRouter:
         pagination: ApiPaginationSpec,
         sort: List[ApiSortSpec],
         sortable_fields: List[str],
-        columns: Dict[str, str],
+        columns_detail: Dict[str, Dict[str, str]],
     ) -> str:
         auth_note = " (no API key required)" if spec_tier == "tier0" else ""
         tier_doc = f"**Required Access:** `{spec_tier}`{auth_note}"
-        column_doc = "\n".join([f"- **{name}**: {data_type}" for name, data_type in columns.items()])
+
+        def _format_column(name: str, info: Dict[str, str]) -> str:
+            base = f"- **{name}** (`{info.get('data_type', 'String')}`)"
+            description = info.get("description", "")
+            return f"{base}: {description}" if description else base
+
+        column_doc = "\n".join(
+            _format_column(name, info) for name, info in columns_detail.items()
+        )
 
         description_parts = [tier_doc, dbt_node.get("description", "")]
         if metadata_enabled and parameters:
@@ -307,6 +315,7 @@ class DynamicRouter:
             raise ApiMetadataError(f"{model_name}: model not found in manifest")
 
         columns = manifest.get_columns(model_name)
+        columns_detail = manifest.get_column_details(model_name)
         dbt_tags = manifest.get_tags(model_name)
         path = self._build_url_path(model_name, dbt_tags, override)
         if not path:
@@ -332,7 +341,7 @@ class DynamicRouter:
             pagination=behavior.pagination,
             sort=behavior.sort,
             sortable_fields=behavior.sortable_fields,
-            columns=columns,
+            columns_detail=columns_detail,
         )
 
         return ApiEndpointSpec(
@@ -356,6 +365,7 @@ class DynamicRouter:
             resource=resource,
             granularity=granularity,
             window=window,
+            columns_detail=columns_detail,
         )
 
     def _parse_route_path(self, path: str) -> Optional[Tuple[str, str, Optional[str]]]:
@@ -1027,7 +1037,54 @@ class DynamicRouter:
 
         return parameters
 
-    def _build_envelope_openapi_responses(self) -> Dict[str, Any]:
+    def _clickhouse_type_to_openapi(self, ch_type: str) -> Dict[str, Any]:
+        if not ch_type:
+            return {"type": "string"}
+
+        normalized = ch_type.strip()
+
+        # Unwrap modifier wrappers that don't change the JSON representation.
+        for wrapper in ("Nullable", "LowCardinality"):
+            prefix = f"{wrapper}("
+            if normalized.startswith(prefix) and normalized.endswith(")"):
+                return self._clickhouse_type_to_openapi(normalized[len(prefix):-1])
+
+        if normalized.startswith("Array(") and normalized.endswith(")"):
+            inner = normalized[len("Array("):-1]
+            return {"type": "array", "items": self._clickhouse_type_to_openapi(inner)}
+
+        lowered = normalized.lower()
+        if lowered.startswith("bool"):
+            return {"type": "boolean"}
+        if lowered.startswith(("float", "decimal")):
+            return {"type": "number"}
+        if lowered.startswith(("uint", "int")):
+            return {"type": "integer"}
+        if lowered.startswith("datetime"):
+            return {"type": "string", "format": "date-time"}
+        if lowered.startswith("date"):
+            return {"type": "string", "format": "date"}
+        return {"type": "string"}
+
+    def _build_item_schema(self, spec: ApiEndpointSpec) -> Dict[str, Any]:
+        properties: Dict[str, Any] = {}
+        for name, info in spec.columns_detail.items():
+            prop = self._clickhouse_type_to_openapi(info.get("data_type", "String"))
+            description = info.get("description", "")
+            if description:
+                prop["description"] = description
+            properties[name] = prop
+
+        item_schema: Dict[str, Any] = {
+            "type": "object",
+            # SELECT * may return columns beyond those declared in the manifest.
+            "additionalProperties": True,
+        }
+        if properties:
+            item_schema["properties"] = properties
+        return item_schema
+
+    def _build_envelope_openapi_responses(self, spec: ApiEndpointSpec) -> Dict[str, Any]:
         return {
             "200": {
                 "description": "Paginated response",
@@ -1039,10 +1096,7 @@ class DynamicRouter:
                             "properties": {
                                 "items": {
                                     "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "additionalProperties": True,
-                                    },
+                                    "items": self._build_item_schema(spec),
                                 },
                                 "pagination": {
                                     "type": "object",
@@ -1061,6 +1115,21 @@ class DynamicRouter:
             }
         }
 
+    def _build_list_openapi_responses(self, spec: ApiEndpointSpec) -> Dict[str, Any]:
+        return {
+            "200": {
+                "description": "List response",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "array",
+                            "items": self._build_item_schema(spec),
+                        },
+                    },
+                },
+            }
+        }
+
     def _build_openapi_extra(
         self,
         spec: ApiEndpointSpec,
@@ -1070,7 +1139,9 @@ class DynamicRouter:
         if parameters:
             openapi_extra["parameters"] = parameters
         if self._uses_envelope_pagination(spec):
-            openapi_extra["responses"] = self._build_envelope_openapi_responses()
+            openapi_extra["responses"] = self._build_envelope_openapi_responses(spec)
+        else:
+            openapi_extra["responses"] = self._build_list_openapi_responses(spec)
         return openapi_extra or None
 
     def _create_post_body_model(self, spec: ApiEndpointSpec):

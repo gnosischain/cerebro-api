@@ -168,6 +168,19 @@ class ManifestLoader:
             cols[col_name] = col_meta.get("data_type", "String")
         return cols
 
+    def get_column_details(self, model_name: str) -> Dict[str, Dict[str, str]]:
+        node = self.get_model(model_name)
+        if not node:
+            return {}
+
+        details: Dict[str, Dict[str, str]] = {}
+        for col_name, col_meta in node.get("columns", {}).items():
+            details[col_name] = {
+                "data_type": col_meta.get("data_type", "String"),
+                "description": col_meta.get("description", "") or "",
+            }
+        return details
+
     def get_tags(self, model_name: str) -> List[str]:
         node = self.get_model(model_name)
         if not node:

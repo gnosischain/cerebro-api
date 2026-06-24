@@ -100,6 +100,7 @@ def _make_model_entry(
     model_name: str,
     path_tags: list[str],
     raw_api: dict,
+    column_descriptions: dict | None = None,
 ) -> dict:
     return {
         "node": {
@@ -110,16 +111,26 @@ def _make_model_entry(
         },
         "tags": path_tags,
         "columns": deepcopy(VALIDATOR_COLUMNS),
+        "column_descriptions": column_descriptions or {},
         "table_name": f"dbt.{model_name}",
     }
 
 
 def _build_manifest_mock(models: dict[str, dict]) -> MagicMock:
+    def _column_details(model_name: str) -> dict[str, dict[str, str]]:
+        entry = models[model_name]
+        descriptions = entry.get("column_descriptions", {})
+        return {
+            name: {"data_type": data_type, "description": descriptions.get(name, "")}
+            for name, data_type in entry["columns"].items()
+        }
+
     mock_manifest = MagicMock()
     mock_manifest.get_all_models.return_value = list(models.keys())
     mock_manifest.get_model.side_effect = lambda model_name: models[model_name]["node"]
     mock_manifest.get_tags.side_effect = lambda model_name: models[model_name]["tags"]
     mock_manifest.get_columns.side_effect = lambda model_name: models[model_name]["columns"]
+    mock_manifest.get_column_details.side_effect = _column_details
     mock_manifest.get_table_name.side_effect = lambda model_name: models[model_name]["table_name"]
     return mock_manifest
 
@@ -659,3 +670,104 @@ class TestUserControlledSortingRoutes:
         assert latest_post_schema["properties"]["sort_direction"]["enum"] == ["ASC", "DESC"]
         assert "sort_by" not in daily_post_schema["properties"]
         assert "sort_direction" not in daily_post_schema["properties"]
+
+
+class TestWindowGranularityPath:
+    def _models(self) -> dict[str, dict]:
+        envelope_api = deepcopy(VALIDATOR_API)
+        envelope_api["pagination"]["response"] = "envelope"
+
+        return {
+            # granularity == window -> the duplicated segment must collapse to one.
+            "api_execution_gpay_cashback_7d": _make_model_entry(
+                "api_execution_gpay_cashback_7d",
+                ["production", "execution", "gpay", "tier1", "api:gpay_cashback", "granularity:7d", "window:7d"],
+                envelope_api,
+            ),
+            # granularity != window -> both segments are legitimate and preserved.
+            "api_execution_gpay_attribution_7d": _make_model_entry(
+                "api_execution_gpay_attribution_7d",
+                ["production", "execution", "gpay", "tier1", "api:gpay_attribution", "granularity:rolling_180d", "window:7d"],
+                envelope_api,
+            ),
+        }
+
+    def test_equal_window_and_granularity_collapse_to_single_segment(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            openapi = harness.app.openapi()
+
+        assert "/v1/execution/gpay_cashback/7d" in openapi["paths"]
+        assert "/v1/execution/gpay_cashback/7d/7d" not in openapi["paths"]
+
+    def test_summary_does_not_duplicate_equal_window(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            openapi = harness.app.openapi()
+
+        summary = openapi["paths"]["/v1/execution/gpay_cashback/7d"]["get"]["summary"]
+        # "(7d)" comes from granularity; the window must not add a duplicate "[7d]".
+        assert "(7d)" in summary
+        assert "[7d]" not in summary
+
+    def test_differing_window_and_granularity_are_preserved(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            openapi = harness.app.openapi()
+
+        assert "/v1/execution/gpay_attribution/rolling_180d/7d" in openapi["paths"]
+
+
+class TestColumnDescriptionsInSwagger:
+    COLUMN_DESCRIPTIONS = {
+        "balance": "Validator effective balance in Gwei.",
+        "status": "Lifecycle status of the validator.",
+        "slot_timestamp": "Wall-clock time of the slot.",
+    }
+
+    def _models(self) -> dict[str, dict]:
+        envelope_api = deepcopy(VALIDATOR_API)
+        envelope_api["pagination"]["response"] = "envelope"
+        list_api = deepcopy(VALIDATOR_API)
+
+        return {
+            "api_consensus_validators_status_latest": _make_model_entry(
+                "api_consensus_validators_status_latest",
+                ["production", "consensus", "tier1", "api:validators_status", "granularity:latest"],
+                envelope_api,
+                column_descriptions=self.COLUMN_DESCRIPTIONS,
+            ),
+            "api_consensus_validators_status_daily": _make_model_entry(
+                "api_consensus_validators_status_daily",
+                ["production", "consensus", "tier1", "api:validators_status", "granularity:daily"],
+                list_api,
+                column_descriptions=self.COLUMN_DESCRIPTIONS,
+            ),
+        }
+
+    def test_endpoint_description_includes_column_descriptions(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            openapi = harness.app.openapi()
+
+        description = openapi["paths"]["/v1/consensus/validators_status/latest"]["get"]["description"]
+        assert "Validator effective balance in Gwei." in description
+        assert "**balance** (`UInt64`)" in description
+
+    def test_envelope_item_schema_has_typed_properties_with_descriptions(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            openapi = harness.app.openapi()
+
+        schema = openapi["paths"]["/v1/consensus/validators_status/latest"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        item_schema = schema["properties"]["items"]["items"]
+        props = item_schema["properties"]
+
+        assert props["balance"] == {"type": "integer", "description": "Validator effective balance in Gwei."}
+        assert props["status"] == {"type": "string", "description": "Lifecycle status of the validator."}
+        assert props["slot_timestamp"]["format"] == "date-time"
+        # SELECT * may return more columns than the manifest declares.
+        assert item_schema["additionalProperties"] is True
+
+    def test_non_envelope_endpoint_documents_array_item_schema(self):
+        with DynamicRouteHarness(self._models(), _make_rows(1)) as harness:
+            openapi = harness.app.openapi()
+
+        schema = openapi["paths"]["/v1/consensus/validators_status/daily"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        assert schema["type"] == "array"
+        assert schema["items"]["properties"]["balance"]["type"] == "integer"
