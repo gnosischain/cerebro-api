@@ -2,6 +2,7 @@ import logging
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_redoc_html
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -40,7 +41,20 @@ app = FastAPI(
     title=settings.API_TITLE,
     version=settings.API_VERSION,
     description=description,
+    # Default ReDoc page loads redoc@next from jsdelivr, whose bundle path
+    # broke when the next tag moved to 3.0.0-rc.0 — served by the custom
+    # /redoc route below, pinned to redoc@2.
+    redoc_url=None,
 )
+
+
+@app.get("/redoc", include_in_schema=False)
+async def redoc_html():
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - ReDoc",
+        redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
+    )
 
 # SlowAPI state + 429 handler
 app.state.limiter = limiter
